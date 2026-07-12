@@ -1,0 +1,354 @@
+package com.marmanis.chebfun4j;
+
+/**
+ * A finite ordered collection of {@link Chebfun}s on a common
+ * {@link Domain}, treated as an "∞ × n matrix" — each column is a
+ * continuous function of {@code x ∈ [a, b]}, and the discrete index runs
+ * over the columns. The name and layout follow MATLAB chebfun's
+ * quasimatrix concept.
+ *
+ * <p>The MVP surface is intentionally small: the shape you need for
+ * {@code Chebop.eigs}'s return value plus the couple of pieces of linear
+ * algebra ({@link #innerProduct} of two columns, per-column
+ * {@link #normalize}) that let the caller work with eigenfunctions
+ * meaningfully. QR / SVD of a quasimatrix are follow-ups — see the
+ * iteration 3 README notes.
+ *
+ * <p>Immutable and thread-safe; every operation returns a fresh
+ * quasimatrix. Column access ({@link #get}) returns a shared reference —
+ * {@code Chebfun} is itself immutable, so this is safe.
+ */
+public final class Quasimatrix {
+    private final Chebfun[] columns;
+    private final Domain domain;
+
+    public Quasimatrix(Chebfun[] columns) {
+        if (columns == null || columns.length == 0) {
+            throw new IllegalArgumentException("quasimatrix requires >= 1 column");
+        }
+        Domain d = columns[0].domain();
+        for (int i = 1; i < columns.length; i++) {
+            if (!columns[i].domain().equalsDomain(d)) {
+                throw new IllegalArgumentException(
+                    "all columns must share the domain " + d + ", column " + i +
+                    " is on " + columns[i].domain());
+            }
+        }
+        this.columns = columns.clone();
+        this.domain = d;
+    }
+
+    /** Number of columns (functions). */
+    public int numColumns() {
+        return columns.length;
+    }
+
+    /** Shared domain of every column. */
+    public Domain domain() {
+        return domain;
+    }
+
+    /** The {@code k}-th column (0-indexed). */
+    public Chebfun get(int k) {
+        return columns[k];
+    }
+
+    /** A fresh array of all columns. */
+    public Chebfun[] columns() {
+        return columns.clone();
+    }
+
+    /**
+     * Continuous {@code L^2([a, b])} inner product of columns {@code i} and
+     * {@code j} — {@code integral_a^b f_i(x) f_j(x) dx}. Uses the product
+     * chebfun's exact integral formula.
+     */
+    public double innerProduct(int i, int j) {
+        return columns[i].times(columns[j]).sum();
+    }
+
+    /**
+     * The {@code L^2} norm of column {@code k}. Equivalent to
+     * {@code sqrt(innerProduct(k, k))} but delegates to
+     * {@link Chebfun#norm2} for the same computation with tighter numerical
+     * safeguards.
+     */
+    public double columnNorm2(int k) {
+        return columns[k].norm2();
+    }
+
+    /**
+     * Return a new quasimatrix in which every column has been scaled so
+     * that its {@code L^2} norm is {@code 1}. Zero-norm columns (an
+     * identically-zero eigenfunction, say) are left unchanged.
+     */
+    public Quasimatrix normalizeColumns() {
+        Chebfun[] out = new Chebfun[columns.length];
+        for (int k = 0; k < columns.length; k++) {
+            double norm = columns[k].norm2();
+            out[k] = (norm == 0.0) ? columns[k] : columns[k].times(1.0 / norm);
+        }
+        return new Quasimatrix(out);
+    }
+
+    /** Column-wise addition; requires the same number of columns. */
+    public Quasimatrix plus(Quasimatrix other) {
+        requireSameShape(other, "plus");
+        Chebfun[] out = new Chebfun[columns.length];
+        for (int k = 0; k < columns.length; k++) out[k] = columns[k].plus(other.columns[k]);
+        return new Quasimatrix(out);
+    }
+
+    /** Column-wise subtraction. */
+    public Quasimatrix minus(Quasimatrix other) {
+        requireSameShape(other, "minus");
+        Chebfun[] out = new Chebfun[columns.length];
+        for (int k = 0; k < columns.length; k++) out[k] = columns[k].minus(other.columns[k]);
+        return new Quasimatrix(out);
+    }
+
+    /** Scale every column by {@code s}. */
+    public Quasimatrix times(double s) {
+        Chebfun[] out = new Chebfun[columns.length];
+        for (int k = 0; k < columns.length; k++) out[k] = columns[k].times(s);
+        return new Quasimatrix(out);
+    }
+
+    // ---------------------------------------------------------------
+    // Singular-value decomposition
+    // ---------------------------------------------------------------
+
+    /**
+     * Result of {@link #svd() singular-value decomposition}:
+     * {@code A = U * diag(sigma) * V^T} where {@code U} is a quasimatrix
+     * of {@code L^2}-orthonormal left singular functions, {@code sigma}
+     * is a length-{@code n} vector of singular values in descending
+     * order, and {@code Vt} is an {@code n × n} orthogonal matrix (row
+     * major).
+     */
+    public record Svd(Quasimatrix U, double[] sigma, double[][] Vt) {}
+
+    /**
+     * Singular-value decomposition of this quasimatrix. Computed via the
+     * standard two-step reduction: first {@link #qr(Algorithm) Householder
+     * QR} gives {@code A = Q R} with an orthonormal quasimatrix
+     * {@code Q} and a small upper-triangular {@code R}; then
+     * {@link com.marmanis.jax4j.api.Linalg#svd Linalg.svd} on {@code R}
+     * yields {@code R = U_R Σ V^T}. Assembling gives
+     * {@code A = (Q U_R) Σ V^T} — so the left singular functions are
+     * a linear combination of {@code Q}'s columns.
+     *
+     * <p>The reduction to a small numerical matrix is what makes this
+     * tractable: {@code Linalg.svd} on an {@code n × n} dense matrix is
+     * the same problem LAPACK's {@code DGESVD} solves in seconds even
+     * at moderate {@code n}. Householder QR (rather than MGS) is used
+     * so orthogonality of {@code Q} stays tight even on ill-conditioned
+     * quasimatrices.
+     */
+    public Svd svd() {
+        Qr qr = qr(Algorithm.HOUSEHOLDER);
+        int n = columns.length;
+        // Build R as an m×n NDArray (m = n here since R is n×n).
+        double[] Rflat = new double[n * n];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) Rflat[i * n + j] = qr.R()[i][j];
+        }
+        com.marmanis.jax4j.core.NDArray Rarr =
+            new com.marmanis.jax4j.core.ConcreteNDArray(Rflat,
+                new com.marmanis.jax4j.core.Shape(n, n));
+        com.marmanis.jax4j.api.Linalg.Svd s = com.marmanis.jax4j.api.Linalg.svd(Rarr);
+        double[] Ur = s.U().toDoubleArray();
+        double[] sigma = s.sigma().toDoubleArray();
+        double[] Vt = s.Vt().toDoubleArray();
+        // Assemble U as a quasimatrix: U[:, j] = sum_i Q[:, i] * Ur[i, j].
+        Chebfun[] qCols = qr.Q().columns;
+        Chebfun[] Ucols = new Chebfun[n];
+        for (int j = 0; j < n; j++) {
+            Chebfun col = null;
+            for (int i = 0; i < n; i++) {
+                double c = Ur[i * n + j];
+                if (c == 0.0) continue;
+                Chebfun term = qCols[i].times(c);
+                col = (col == null) ? term : col.plus(term);
+            }
+            if (col == null) col = Chebfun.constant(0.0, domain);
+            Ucols[j] = col;
+        }
+        double[][] VtOut = new double[n][n];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) VtOut[i][j] = Vt[i * n + j];
+        }
+        return new Svd(new Quasimatrix(Ucols), sigma, VtOut);
+    }
+
+    // ---------------------------------------------------------------
+    // QR decomposition
+    // ---------------------------------------------------------------
+
+    /**
+     * Result of {@link #qr(Algorithm) QR decomposition}: {@code Q} has
+     * {@code L^2}-orthonormal columns spanning the same range as the
+     * original quasimatrix, and {@code R} is a small {@code n × n}
+     * upper-triangular numerical matrix such that {@code A = Q R}.
+     */
+    public record Qr(Quasimatrix Q, double[][] R) {}
+
+    /**
+     * QR algorithm selection.
+     * <ul>
+     *   <li>{@link #MODIFIED_GRAM_SCHMIDT} — column-wise Gram-Schmidt
+     *       with the "modified" order (each new column subtracts
+     *       already-computed {@code q_i} contributions using the
+     *       running residual, not the original column). Numerically
+     *       better than classical GS on mildly ill-conditioned inputs
+     *       but not the last word on stability.</li>
+     *   <li>{@link #HOUSEHOLDER} — chebfun-style Householder reflectors
+     *       (Trefethen 2010). More robust on very ill-conditioned
+     *       quasimatrices where MGS loses orthogonality noticeably.</li>
+     * </ul>
+     */
+    public enum Algorithm { MODIFIED_GRAM_SCHMIDT, HOUSEHOLDER }
+
+    /**
+     * Compute the QR decomposition of this quasimatrix using
+     * {@link Algorithm#MODIFIED_GRAM_SCHMIDT modified Gram-Schmidt}.
+     */
+    public Qr qr() {
+        return qr(Algorithm.MODIFIED_GRAM_SCHMIDT);
+    }
+
+    /** Compute the QR decomposition of this quasimatrix. */
+    public Qr qr(Algorithm algorithm) {
+        return switch (algorithm) {
+            case MODIFIED_GRAM_SCHMIDT -> qrModifiedGramSchmidt();
+            case HOUSEHOLDER           -> qrHouseholder();
+        };
+    }
+
+    private Qr qrModifiedGramSchmidt() {
+        int n = columns.length;
+        Chebfun[] q = new Chebfun[n];
+        double[][] R = new double[n][n];
+        for (int j = 0; j < n; j++) {
+            Chebfun v = columns[j];
+            for (int i = 0; i < j; i++) {
+                double rij = q[i].times(v).sum();
+                R[i][j] = rij;
+                if (rij != 0.0) v = v.minus(q[i].times(rij));
+            }
+            double norm = v.norm2();
+            R[j][j] = norm;
+            q[j] = (norm == 0.0) ? v : v.times(1.0 / norm);
+        }
+        return new Qr(new Quasimatrix(q), R);
+    }
+
+    /**
+     * Householder QR on a quasimatrix. Follows Trefethen's construction
+     * (see "Householder triangularization of a quasimatrix", IMA J.
+     * Numer. Anal. 2010): at step {@code k}, build a reflector defined
+     * by an orthonormal Chebfun {@code v_k} that zeroes out the "below-
+     * diagonal" part of column {@code k}. The "diagonal" of a
+     * quasimatrix is chosen deterministically — we use the sign-
+     * canonical scalar {@code alpha = -sign(<e_k, x>) ||x||} where the
+     * "elementary column" {@code e_k} is the first Legendre-orthonormal
+     * basis chebfun at index {@code k}. In practice for chebfun4j's
+     * needs the choice of {@code e_k} basis doesn't matter for
+     * correctness of {@code Q R = A}; we just need a consistent
+     * "vertical direction".
+     *
+     * <p>Uses the same Chebyshev basis as everything else in chebfun4j
+     * for the {@code e_k}. This makes the resulting Q's columns look
+     * MGS-like on well-conditioned inputs but keeps them tightly
+     * orthogonal even when MGS starts losing.
+     */
+    private Qr qrHouseholder() {
+        int n = columns.length;
+        // Working copies of the columns; we'll reduce them in place.
+        Chebfun[] work = columns.clone();
+        // "E-basis": e_k is a chebfun whose columns are progressively
+        // orthonormal on the domain. We build them by applying MGS to a
+        // simple set (constant, x, x^2, ..., x^{n-1}). That gives an
+        // orthonormal basis of the polynomial space up to degree n-1 —
+        // exactly the space our quasimatrix columns live in when they
+        // came out of a chebfun4j Chebtech fit. See Trefethen 2010
+        // section 4 for why any orthonormal e-basis works.
+        Chebfun[] e = orthonormalMonomialBasis(domain, n);
+        // For accumulating the reflectors we track Q as its columns.
+        // Each reflector is v_k (an orthonormal chebfun) and Q's k-th
+        // column is the reflected e_k.
+        Chebfun[] v = new Chebfun[n];
+        double[][] R = new double[n][n];
+        for (int k = 0; k < n; k++) {
+            Chebfun x = work[k];
+            // Compute alpha = sign correction and norm; sign convention
+            // matches LAPACK's DLARFG for reproducibility.
+            double xkEk = x.times(e[k]).sum();
+            double xNorm = x.norm2();
+            double alpha = (xkEk >= 0) ? -xNorm : xNorm;
+            R[k][k] = alpha;
+            // v_k = (x - alpha e_k), then normalize to unit norm.
+            Chebfun w = x.minus(e[k].times(alpha));
+            double wNorm = w.norm2();
+            v[k] = (wNorm == 0.0) ? w : w.times(1.0 / wNorm);
+            // Apply reflector I - 2 v v^T to columns j > k. Also
+            // record the corresponding R[k][j] entries.
+            for (int j = k + 1; j < n; j++) {
+                double dot = v[k].times(work[j]).sum();
+                work[j] = work[j].minus(v[k].times(2.0 * dot));
+                R[k][j] = e[k].times(work[j]).sum();
+                work[j] = work[j].minus(e[k].times(R[k][j]));
+            }
+        }
+        // Reconstruct Q: q_k is the result of applying reflectors
+        // (in reverse order) to e_k. We walk backward through v.
+        Chebfun[] q = new Chebfun[n];
+        for (int k = 0; k < n; k++) {
+            Chebfun qk = e[k];
+            for (int i = k; i >= 0; i--) {
+                double dot = v[i].times(qk).sum();
+                qk = qk.minus(v[i].times(2.0 * dot));
+            }
+            q[k] = qk;
+        }
+        return new Qr(new Quasimatrix(q), R);
+    }
+
+    /**
+     * Build an {@code L^2}-orthonormal chebfun basis of the polynomial
+     * space {@code span{1, x, x^2, ..., x^{n-1}}} on {@code domain} via
+     * MGS. This is the "vertical direction" reference basis for
+     * {@link #qrHouseholder}.
+     */
+    private static Chebfun[] orthonormalMonomialBasis(Domain domain, int n) {
+        Chebfun[] mono = new Chebfun[n];
+        for (int k = 0; k < n; k++) {
+            final int power = k;
+            mono[k] = new Chebfun(x -> Math.pow(x, power), domain);
+        }
+        // Orthonormalize via MGS.
+        Chebfun[] e = new Chebfun[n];
+        for (int k = 0; k < n; k++) {
+            Chebfun v = mono[k];
+            for (int i = 0; i < k; i++) {
+                double r = e[i].times(v).sum();
+                if (r != 0.0) v = v.minus(e[i].times(r));
+            }
+            double norm = v.norm2();
+            e[k] = (norm == 0.0) ? v : v.times(1.0 / norm);
+        }
+        return e;
+    }
+
+    private void requireSameShape(Quasimatrix other, String op) {
+        if (other.columns.length != columns.length) {
+            throw new IllegalArgumentException(
+                op + " requires matching column counts: " +
+                columns.length + " vs " + other.columns.length);
+        }
+        if (!other.domain.equalsDomain(domain)) {
+            throw new IllegalArgumentException(
+                op + " requires matching domains: " + domain + " vs " + other.domain);
+        }
+    }
+}
