@@ -90,4 +90,78 @@ public class ChebopTest {
         assertClose(0.3, u.feval(0.0), 1e-10, "u(a)");
         assertClose(0.7, u.feval(1.0), 1e-10, "u(b)");
     }
+
+    // -----------------------------------------------------------------
+    // Discretization + conditionNumber
+    // -----------------------------------------------------------------
+
+    @Test
+    public void testDiscretizeSolveMatchesDirectSolve() {
+        // u'' - u = 0 on [0, 1] with u(0) = 1, u(1) = 1/e. Solution: e^{-x}.
+        // discretize + solve should produce the same Chebfun as L.solve at
+        // the corresponding grid size.
+        Domain d = new Domain(0.0, 1.0);
+        Chebop L = Chebop.constantCoefficients(d, -1.0, 0.0, 1.0);
+        Chebop.Discretization disc = L.discretize(
+            new BoundaryCondition.Dirichlet(1.0),
+            new BoundaryCondition.Dirichlet(1.0 / Math.E),
+            32);
+        Chebfun u = disc.solve(x -> 0.0);
+        for (double x : new double[]{0.1, 0.3, 0.5, 0.7, 0.9}) {
+            assertClose(Math.exp(-x), u.feval(x), 1e-10, "discretize-solved @ " + x);
+        }
+    }
+
+    @Test
+    public void testDiscretizeReusableAcrossMultipleRhs() {
+        // Same operator + BCs, three different RHS. Each solve should match
+        // a fresh L.solve at the same n.
+        Domain d = new Domain(0.0, 1.0);
+        Chebop L = Chebop.constantCoefficients(d, 0.0, 0.0, 1.0); // u''
+        Chebop.Discretization disc = L.discretize(
+            new BoundaryCondition.Dirichlet(0.0),
+            new BoundaryCondition.Dirichlet(0.0),
+            64);
+        // u'' = -pi^2 sin(pi x) -> u(x) = sin(pi x).
+        Chebfun uSin = disc.solve(x -> -Math.PI * Math.PI * Math.sin(Math.PI * x));
+        assertClose(1.0, uSin.feval(0.5), 1e-10, "sin @ 0.5");
+        // u'' = 12 x - 6 -> u(x) = 2x^3 - 3x^2 + x (Dirichlet 0/0).
+        Chebfun uCubic = disc.solve(x -> 12 * x - 6);
+        assertClose(2 * 0.5 * 0.5 * 0.5 - 3 * 0.5 * 0.5 + 0.5, uCubic.feval(0.5), 1e-10, "cubic @ 0.5");
+        // u'' = 2 -> u(x) = x^2 - x (Dirichlet 0/0).
+        Chebfun uQuad = disc.solve(x -> 2.0);
+        assertClose(-0.25, uQuad.feval(0.5), 1e-10, "quadratic @ 0.5");
+    }
+
+    @Test
+    public void testConditionNumberIsFiniteAndSensible() {
+        // -u'' on [0, π] with Dirichlet(0, 0). Well-posed BVP; κ should be
+        // finite, > 1, and grow with n (Chebyshev D² has O(n²) growth).
+        Domain d = new Domain(0.0, Math.PI);
+        Chebop L = Chebop.constantCoefficients(d, 0.0, 0.0, -1.0); // -u''
+        BoundaryCondition bcA = new BoundaryCondition.Dirichlet(0.0);
+        BoundaryCondition bcB = new BoundaryCondition.Dirichlet(0.0);
+        double c32 = L.discretize(bcA, bcB, 32).conditionNumber();
+        double c128 = L.discretize(bcA, bcB, 128).conditionNumber();
+        if (!Double.isFinite(c32) || c32 <= 1.0) {
+            throw new AssertionError("cond at n=32 not finite/>1: " + c32);
+        }
+        if (!Double.isFinite(c128) || c128 <= c32) {
+            throw new AssertionError("cond at n=128 should exceed cond at n=32; got "
+                + c32 + " vs " + c128);
+        }
+    }
+
+    @Test
+    public void testDiscretizationReportsCorrectN() {
+        Domain d = new Domain(0.0, 1.0);
+        Chebop L = Chebop.constantCoefficients(d, 0.0, 0.0, 1.0);
+        Chebop.Discretization disc = L.discretize(
+            new BoundaryCondition.Dirichlet(0.0),
+            new BoundaryCondition.Dirichlet(0.0),
+            64);
+        if (disc.n() != 64) {
+            throw new AssertionError("expected n=64, got " + disc.n());
+        }
+    }
 }
