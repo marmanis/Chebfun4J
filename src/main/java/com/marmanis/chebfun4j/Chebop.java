@@ -135,6 +135,123 @@ public final class Chebop {
     }
 
     /**
+     * A cached, LU-factored discretisation of this operator at grid size
+     * {@code n} with the given boundary conditions. Once obtained, a
+     * {@link #solve} call is O(n²) — the O(n³) matrix build + factorisation
+     * is paid only once. Use for parametric sweeps in the right-hand side,
+     * batch solves, or when you want to interrogate the discretised system
+     * (e.g. via {@link #conditionNumber}).
+     */
+    public static final class Discretization {
+        private final int n;
+        private final double[] xGrid;
+        private final Linalg.LU lu;
+        private final double bcAValue;
+        private final double bcBValue;
+        private final Domain domain;
+
+        private Discretization(int n, double[] xGrid, Linalg.LU lu,
+                               double bcAValue, double bcBValue, Domain domain) {
+            this.n = n;
+            this.xGrid = xGrid;
+            this.lu = lu;
+            this.bcAValue = bcAValue;
+            this.bcBValue = bcBValue;
+            this.domain = domain;
+        }
+
+        /** Grid size the operator was discretised at. */
+        public int n() { return n; }
+
+        /**
+         * Solve {@code L u = rhs} at this fixed grid, returning the smooth
+         * Chebfun that interpolates the collocation-grid values.
+         */
+        public Chebfun solve(DoubleUnaryOperator rhs) {
+            return new Chebfun(Chebtech.fromValues(solveRawValues(rhs)), domain);
+        }
+
+        /** Same as {@link #solve(DoubleUnaryOperator)} for a Chebfun RHS. */
+        public Chebfun solve(Chebfun rhs) {
+            return solve(rhs::feval);
+        }
+
+        /**
+         * ∞-norm condition-number estimate of the discretised collocation
+         * matrix (with the BC rows already substituted in). A large value
+         * — say, {@code > 10¹⁰} — means the linear solve at this grid is
+         * losing significant digits and the reported solution deserves
+         * scepticism. Uses {@link Linalg#cond(Linalg.LU)}: Hager's iteration
+         * against the already-cached factorisation, so no re-factorisation.
+         */
+        public double conditionNumber() {
+            return Linalg.cond(lu);
+        }
+
+        /**
+         * Raw collocation-grid values solving {@code L u = rhs}. Used by
+         * {@link Chebop#solveAt} and by {@link Chebop#solve}'s adaptive
+         * loop; end users typically want the {@link Chebfun} form.
+         */
+        double[] solveRawValues(DoubleUnaryOperator rhs) {
+            int size = n + 1;
+            double[] b = new double[size];
+            for (int i = 0; i < size; i++) b[i] = rhs.applyAsDouble(xGrid[i]);
+            // BC rows override RHS at row 0 (x = b endpoint) and row n (x = a).
+            b[0] = bcBValue;
+            b[n] = bcAValue;
+            return lu.solve(b);
+        }
+    }
+
+    /**
+     * Discretise this operator to an {@code (n+1) × (n+1)} spectral
+     * collocation system with the given boundary conditions, factor it,
+     * and return the reusable {@link Discretization}. Every subsequent
+     * {@link Discretization#solve} is O(n²).
+     */
+    public Discretization discretize(BoundaryCondition bcA, BoundaryCondition bcB, int n) {
+        int size = n + 1;
+        double[] D = DifferentiationMatrix.chebD(n);
+        // Scale from reference [-1, 1] to physical [a, b]: D_physical = (2/L) D_ref.
+        double jac = 2.0 / domain.length();
+        double[] scaledD = new double[size * size];
+        for (int i = 0; i < size * size; i++) scaledD[i] = jac * D[i];
+
+        int maxOrder = 0;
+        for (Term t : terms) if (t.order() > maxOrder) maxOrder = t.order();
+        double[][] Dpow = new double[maxOrder + 1][];
+        Dpow[0] = identity(size);
+        if (maxOrder >= 1) Dpow[1] = scaledD;
+        for (int k = 2; k <= maxOrder; k++) {
+            Dpow[k] = DifferentiationMatrix.matMul(Dpow[k - 1], scaledD, size);
+        }
+
+        // Chebyshev-2nd-kind grid on the physical domain, ordered so index 0
+        // corresponds to y = +1 (x = b) and index n to y = -1 (x = a) — the
+        // ordering Chebtech.fromValues expects.
+        double[] xGrid = new double[size];
+        for (int j = 0; j <= n; j++) xGrid[j] = domain.fromRef(Math.cos(Math.PI * j / n));
+
+        double[] L = new double[size * size];
+        for (Term t : terms) {
+            double[] Dk = Dpow[t.order()];
+            for (int i = 0; i < size; i++) {
+                double c = t.coeff().feval(xGrid[i]);
+                if (c == 0.0) continue;
+                for (int j = 0; j < size; j++) L[i * size + j] += c * Dk[i * size + j];
+            }
+        }
+
+        // Overwrite the two BC rows with their linear-form coefficients.
+        applyBcToMatrix(L, bcB, /*row=*/0, /*evalCol=*/0, scaledD, size);
+        applyBcToMatrix(L, bcA, /*row=*/n, /*evalCol=*/n, scaledD, size);
+
+        Linalg.LU lu = Linalg.lu(new ConcreteNDArray(L, new Shape(size, size)));
+        return new Discretization(n, xGrid, lu, bcA.value(), bcB.value(), domain);
+    }
+
+    /**
      * @deprecated Prefer the {@link BoundaryCondition}-based overload.
      */
     @Deprecated
@@ -146,90 +263,46 @@ public final class Chebop {
     /** Solve at fixed grid size {@code n} — advanced entry point. */
     public double[] solveAt(DoubleUnaryOperator rhs,
                             BoundaryCondition bcA, BoundaryCondition bcB, int n) {
-        int size = n + 1;
-        double[] D = DifferentiationMatrix.chebD(n);
-        // Scale from reference [-1, 1] to physical [a, b]: D_physical = (2/L) D_ref.
-        double jac = 2.0 / domain.length();
-        double[] scaledD = new double[size * size];
-        for (int i = 0; i < size * size; i++) scaledD[i] = jac * D[i];
-
-        // Powers of D up to the operator's max derivative order.
-        int maxOrder = 0;
-        for (Term t : terms) if (t.order() > maxOrder) maxOrder = t.order();
-        double[][] Dpow = new double[maxOrder + 1][];
-        Dpow[0] = identity(size);
-        if (maxOrder >= 1) Dpow[1] = scaledD;
-        for (int k = 2; k <= maxOrder; k++) {
-            Dpow[k] = DifferentiationMatrix.matMul(Dpow[k - 1], scaledD, size);
-        }
-
-        // Chebyshev-2nd-kind grid on the physical domain, ordered so index 0
-        // corresponds to y = +1 (i.e. x = b) and index n to y = -1 (x = a) —
-        // the ordering Chebtech.fromValues expects.
-        double[] xGrid = new double[size];
-        for (int j = 0; j <= n; j++) {
-            double y = Math.cos(Math.PI * j / n);
-            xGrid[j] = domain.fromRef(y);
-        }
-
-        double[] L = new double[size * size];
-        for (Term t : terms) {
-            double[] Dk = Dpow[t.order()];
-            for (int i = 0; i < size; i++) {
-                double c = t.coeff().feval(xGrid[i]);
-                if (c == 0.0) continue;
-                for (int j = 0; j < size; j++) {
-                    L[i * size + j] += c * Dk[i * size + j];
-                }
-            }
-        }
-
-        double[] b = new double[size];
-        for (int i = 0; i < size; i++) b[i] = rhs.applyAsDouble(xGrid[i]);
-
-        // Overwrite row 0 (grid point x = b) with the BC at b, row n (grid
-        // point x = a) with the BC at a. Each BC contributes a linear row
-        // over the size-{@code size} solution vector plus a scalar RHS —
-        // the {@code applyBc} helper builds that row from the appropriate
-        // combination of "pick this grid point" and "row of D at this
-        // point" depending on Dirichlet vs. Neumann vs. Robin.
-        applyBc(L, b, bcB, /*row=*/0, /*evalCol=*/0, scaledD, size);
-        applyBc(L, b, bcA, /*row=*/n, /*evalCol=*/n, scaledD, size);
-
-        NDArray A = new ConcreteNDArray(L, new Shape(size, size));
-        NDArray rhsN = new ConcreteNDArray(b, new Shape(size));
-        return Linalg.solve(A, rhsN).toDoubleArray();
+        return discretize(bcA, bcB, n).solveRawValues(rhs);
     }
 
     /**
-     * Overwrite {@code L[row, *]} and {@code b[row]} to enforce the given
-     * boundary condition at the collocation point of grid index
-     * {@code evalCol} — i.e. the endpoint where the BC is being imposed.
-     * Dirichlet contributes an identity row selecting that grid value;
-     * Neumann contributes the {@code evalCol}-th row of the scaled
-     * differentiation matrix (a discrete derivative at that point); Robin
-     * is the {@code alpha}/{@code beta} linear combination of the two.
+     * Overwrite {@code L[row, *]} to enforce the given boundary condition's
+     * linear form at the collocation point of grid index {@code evalCol} —
+     * i.e. the endpoint where the BC is being imposed. Dirichlet
+     * contributes an identity row selecting that grid value; Neumann
+     * contributes the {@code evalCol}-th row of the scaled differentiation
+     * matrix (a discrete derivative at that point); Robin is the
+     * {@code alpha}/{@code beta} linear combination of the two. The BC's
+     * scalar value (right-hand side) is handled separately by the caller.
      */
-    private static void applyBc(double[] L, double[] b, BoundaryCondition bc,
-                                int row, int evalCol, double[] scaledD, int size) {
+    private static void applyBcToMatrix(double[] L, BoundaryCondition bc,
+                                        int row, int evalCol, double[] scaledD, int size) {
         int rowOff = row * size;
         for (int j = 0; j < size; j++) L[rowOff + j] = 0.0;
         int evalOff = evalCol * size;
         switch (bc) {
-            case BoundaryCondition.Dirichlet d -> {
-                L[rowOff + evalCol] = 1.0;
-                b[row] = d.value();
-            }
-            case BoundaryCondition.Neumann n -> {
+            case BoundaryCondition.Dirichlet d -> L[rowOff + evalCol] = 1.0;
+            case BoundaryCondition.Neumann nb -> {
                 for (int j = 0; j < size; j++) L[rowOff + j] = scaledD[evalOff + j];
-                b[row] = n.value();
             }
             case BoundaryCondition.Robin r -> {
                 L[rowOff + evalCol] += r.alpha();
                 for (int j = 0; j < size; j++) L[rowOff + j] += r.beta() * scaledD[evalOff + j];
-                b[row] = r.value();
             }
         }
+    }
+
+    /**
+     * Overwrite {@code L[row, *]} and {@code b[row]} for the given BC.
+     * Used by {@link #eigsAt} where the "b" is throwaway scratch anyway;
+     * the {@link #discretize} path uses {@link #applyBcToMatrix} plus
+     * separately stashing {@code bc.value()} on the {@link Discretization}.
+     */
+    private static void applyBc(double[] L, double[] b, BoundaryCondition bc,
+                                int row, int evalCol, double[] scaledD, int size) {
+        applyBcToMatrix(L, bc, row, evalCol, scaledD, size);
+        b[row] = bc.value();
     }
 
     /**
