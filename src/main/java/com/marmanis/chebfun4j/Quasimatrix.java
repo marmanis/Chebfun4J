@@ -196,25 +196,31 @@ public final class Quasimatrix {
     /**
      * QR algorithm selection.
      * <ul>
+     *   <li>{@link #HOUSEHOLDER} — <b>default.</b> chebfun-style
+     *       Householder reflectors (Trefethen 2010) built against an
+     *       L²-orthonormal Legendre reference basis. Robust on
+     *       ill-conditioned quasimatrices; recovers Q's orthogonality to
+     *       near machine precision even at column counts (n ≳ 15) where
+     *       Gram-Schmidt loses orthogonality noticeably.</li>
      *   <li>{@link #MODIFIED_GRAM_SCHMIDT} — column-wise Gram-Schmidt
      *       with the "modified" order (each new column subtracts
-     *       already-computed {@code q_i} contributions using the
-     *       running residual, not the original column). Numerically
-     *       better than classical GS on mildly ill-conditioned inputs
-     *       but not the last word on stability.</li>
-     *   <li>{@link #HOUSEHOLDER} — chebfun-style Householder reflectors
-     *       (Trefethen 2010). More robust on very ill-conditioned
-     *       quasimatrices where MGS loses orthogonality noticeably.</li>
+     *       already-computed {@code q_i} contributions using the running
+     *       residual, not the original column). Faster than Householder
+     *       but loses orthogonality on ill-conditioned inputs — opt-in
+     *       when you know the columns are well-separated.</li>
      * </ul>
      */
     public enum Algorithm { MODIFIED_GRAM_SCHMIDT, HOUSEHOLDER }
 
     /**
-     * Compute the QR decomposition of this quasimatrix using
-     * {@link Algorithm#MODIFIED_GRAM_SCHMIDT modified Gram-Schmidt}.
+     * Compute the QR decomposition using
+     * {@link Algorithm#HOUSEHOLDER Householder reflectors} — the robust
+     * default. Use {@link #qr(Algorithm)} with
+     * {@link Algorithm#MODIFIED_GRAM_SCHMIDT} to opt into the faster but
+     * less stable MGS variant.
      */
     public Qr qr() {
-        return qr(Algorithm.MODIFIED_GRAM_SCHMIDT);
+        return qr(Algorithm.HOUSEHOLDER);
     }
 
     /** Compute the QR decomposition of this quasimatrix. */
@@ -251,29 +257,22 @@ public final class Quasimatrix {
      * diagonal" part of column {@code k}. The "diagonal" of a
      * quasimatrix is chosen deterministically — we use the sign-
      * canonical scalar {@code alpha = -sign(<e_k, x>) ||x||} where the
-     * "elementary column" {@code e_k} is the first Legendre-orthonormal
-     * basis chebfun at index {@code k}. In practice for chebfun4j's
+     * "elementary column" {@code e_k} is the {@code k}-th Legendre-
+     * orthonormal basis chebfun (see
+     * {@link #orthonormalLegendreBasis}). In practice for chebfun4j's
      * needs the choice of {@code e_k} basis doesn't matter for
      * correctness of {@code Q R = A}; we just need a consistent
-     * "vertical direction".
-     *
-     * <p>Uses the same Chebyshev basis as everything else in chebfun4j
-     * for the {@code e_k}. This makes the resulting Q's columns look
-     * MGS-like on well-conditioned inputs but keeps them tightly
-     * orthogonal even when MGS starts losing.
+     * "vertical direction" that is itself well-conditioned.
      */
     private Qr qrHouseholder() {
         int n = columns.length;
         // Working copies of the columns; we'll reduce them in place.
         Chebfun[] work = columns.clone();
-        // "E-basis": e_k is a chebfun whose columns are progressively
-        // orthonormal on the domain. We build them by applying MGS to a
-        // simple set (constant, x, x^2, ..., x^{n-1}). That gives an
-        // orthonormal basis of the polynomial space up to degree n-1 —
-        // exactly the space our quasimatrix columns live in when they
-        // came out of a chebfun4j Chebtech fit. See Trefethen 2010
+        // "E-basis": Legendre polynomials on the domain, rescaled to unit L²
+        // norm. Already orthonormal by construction — no MGS pass, no
+        // exponential ill-conditioning. See Trefethen 2010
         // section 4 for why any orthonormal e-basis works.
-        Chebfun[] e = orthonormalMonomialBasis(domain, n);
+        Chebfun[] e = orthonormalLegendreBasis(domain, n);
         // For accumulating the reflectors we track Q as its columns.
         // Each reflector is v_k (an orthonormal chebfun) and Q's k-th
         // column is the reflected e_k.
