@@ -316,26 +316,57 @@ public final class Quasimatrix {
 
     /**
      * Build an {@code L^2}-orthonormal chebfun basis of the polynomial
-     * space {@code span{1, x, x^2, ..., x^{n-1}}} on {@code domain} via
-     * MGS. This is the "vertical direction" reference basis for
-     * {@link #qrHouseholder}.
+     * space of degree {@code < n} on {@code domain}, used as the "vertical
+     * direction" reference basis for {@link #qrHouseholder}.
+     *
+     * <p>Uses <b>Legendre polynomials</b>: they're already {@code L^2}-
+     * orthogonal on {@code [-1, 1]} under the plain (unweighted) inner
+     * product, so the affine-mapped {@code P_k(y(x))} rescaled by
+     * {@code sqrt((2k+1)/(b-a))} is exactly the L²-orthonormal basis on
+     * {@code [a, b]}. No MGS pass is needed — and there's nothing to lose
+     * to numerical cancellation the way the previous
+     * {@code {1, x, x², …, xⁿ⁻¹}}-plus-MGS construction did (that basis is
+     * exponentially ill-conditioned by n ≈ 15 and MGS silently gives up
+     * orthogonality long before it errors).
+     *
+     * <p>The Legendre polynomials are computed by the standard 3-term
+     * recurrence
+     * <pre>
+     *   P_0(y) = 1, P_1(y) = y,
+     *   (k+1) P_{k+1}(y) = (2k+1) y P_k(y) - k P_{k-1}(y),
+     * </pre>
+     * driven directly on Chebfuns of the reference-mapped
+     * {@code y(x) = (2x - (a+b)) / (b-a)}.
      */
-    private static Chebfun[] orthonormalMonomialBasis(Domain domain, int n) {
-        Chebfun[] mono = new Chebfun[n];
-        for (int k = 0; k < n; k++) {
-            final int power = k;
-            mono[k] = new Chebfun(x -> Math.pow(x, power), domain);
-        }
-        // Orthonormalize via MGS.
+    private static Chebfun[] orthonormalLegendreBasis(Domain domain, int n) {
+        double a = domain.a();
+        double b = domain.b();
+        double halfWidth = 0.5 * (b - a);
+        double mid = 0.5 * (a + b);
+        double invLen = 1.0 / (b - a);
         Chebfun[] e = new Chebfun[n];
+        // Evaluate each P_k(y(x)) pointwise via the scalar 3-term recurrence
+        // and let Chebfun's adaptive constructor resolve the polynomial. This
+        // is intentionally NOT recursion over Chebfuns: driving the recurrence
+        // in Chebfun space would apply `.simplify(1e-14)` at every step, and
+        // over 20 steps the truncation cost enough orthogonality to break
+        // Householder QR. Evaluating in double arithmetic at sample points
+        // keeps every P_k accurate to machine precision.
         for (int k = 0; k < n; k++) {
-            Chebfun v = mono[k];
-            for (int i = 0; i < k; i++) {
-                double r = e[i].times(v).sum();
-                if (r != 0.0) v = v.minus(e[i].times(r));
-            }
-            double norm = v.norm2();
-            e[k] = (norm == 0.0) ? v : v.times(1.0 / norm);
+            final int K = k;
+            double c = Math.sqrt((2 * K + 1.0) * invLen);
+            e[k] = new Chebfun(x -> {
+                double y = (x - mid) / halfWidth;
+                double pPrev = 1.0;               // P_0(y)
+                if (K == 0) return c * pPrev;
+                double pCurr = y;                 // P_1(y)
+                for (int m = 1; m < K; m++) {
+                    double pNext = ((2 * m + 1) * y * pCurr - m * pPrev) / (m + 1);
+                    pPrev = pCurr;
+                    pCurr = pNext;
+                }
+                return c * pCurr;
+            }, domain);
         }
         return e;
     }
