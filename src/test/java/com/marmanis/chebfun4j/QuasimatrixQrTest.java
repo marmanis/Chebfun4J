@@ -118,11 +118,53 @@ public class QuasimatrixQrTest {
     }
 
     @Test
-    public void testDefaultAlgorithmIsMGS() {
-        Quasimatrix A = wellConditionedQuasimatrix(new Domain(0.0, 1.0), 3);
-        // Just verify the no-arg call doesn't blow up and gives an
-        // orthonormal Q.
-        Quasimatrix.Qr qr = A.qr();
-        assertClose(1.0, qr.Q().innerProduct(0, 0), 1e-12, "default QR Q'Q[0,0]");
+    public void testDefaultAlgorithmIsHouseholder() {
+        // qr() no-arg should behave identically to qr(HOUSEHOLDER): same R
+        // entries and Q columns whose inner products match to full precision.
+        Domain d = new Domain(-1.0, 1.0);
+        Quasimatrix A = wellConditionedQuasimatrix(d, 4);
+        Quasimatrix.Qr viaDefault  = A.qr();
+        Quasimatrix.Qr viaExplicit = A.qr(Algorithm.HOUSEHOLDER);
+        // R matrices should agree entry-by-entry (same algorithm, same inputs).
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                assertClose(viaExplicit.R()[i][j], viaDefault.R()[i][j], 1e-14, "R[" + i + "][" + j + "]");
+            }
+        }
+    }
+
+    /**
+     * At n=15, Householder QR on a smooth quasimatrix should give a Q whose
+     * columns are L²-orthonormal to at least ~1e-10 — the current
+     * monomials-plus-MGS reference basis fails at n much smaller than that.
+     * The Legendre reference basis with pointwise scalar-recurrence
+     * evaluation is what makes this size reachable.
+     */
+    @Test
+    public void testHouseholderRemainsOrthonormalAtN15() {
+        int n = 15;
+        Domain d = new Domain(-1.0, 1.0);
+        // Well-scaled smooth columns: shifted Chebyshev polynomials cos(k * acos(x/2)).
+        // Bounded, non-oscillatory (compared to cos(kx) at k=20), and span n independent
+        // polynomial directions.
+        Chebfun[] cols = new Chebfun[n];
+        for (int k = 0; k < n; k++) {
+            final int K = k;
+            cols[k] = new Chebfun(x -> Math.cos(K * Math.acos(x)) + 0.1 * (K + 1) * x, d);
+        }
+        Quasimatrix A = new Quasimatrix(cols);
+        Quasimatrix.Qr qr = A.qr(Algorithm.HOUSEHOLDER);
+        double worst = 0.0;
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                double ip = qr.Q().innerProduct(i, j);
+                double want = (i == j) ? 1.0 : 0.0;
+                worst = Math.max(worst, Math.abs(ip - want));
+            }
+        }
+        if (worst > 1e-10) {
+            throw new AssertionError("Householder QR lost orthonormality at n=" + n
+                + ": worst |Q'Q - I| = " + worst);
+        }
     }
 }
