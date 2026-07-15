@@ -122,11 +122,13 @@ public final class Chebop {
                          double tol) {
         Chebfun last = null;
         for (int n : GRID_SIZES) {
-            double[] uVals = solveAt(rhs, bcA, bcB, n);
-            Chebfun candidate = new Chebfun(Chebtech.fromValues(uVals), domain);
+            Chebfun candidate = discretize(bcA, bcB, n).solve(rhs);
             if (last != null) {
-                double vscale = Math.max(1.0, ArrayMath.maxAbs(uVals));
-                double err = ArrayMath.maxAbsDiff(candidate, last);
+                double vscale = Math.max(1.0, candidate.normInf());
+                // Exact residual via difference-normInf, not the sampled probe
+                // used before. The extra Chebfun arithmetic is dwarfed by the
+                // O(n³) solves themselves.
+                double err = candidate.minus(last).normInf();
                 if (err <= tol * vscale) return candidate;
             }
             last = candidate;
