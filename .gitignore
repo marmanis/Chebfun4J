@@ -1,6 +1,10 @@
 
+<<<<<<< HEAD
 .idea/
 
 *.class
 
 target/maven-status/maven-compiler-plugin/compile/default-compile/
+=======
+target/
+>>>>>>> 60abd40 (New demos including Navier-Stokes 3D solver for incompressible flows)

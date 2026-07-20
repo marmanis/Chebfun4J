@@ -133,6 +133,63 @@ public class QuasimatrixQrTest {
         }
     }
 
+<<<<<<< HEAD
+=======
+    // -----------------------------------------------------------------
+    // mrdivide (least-squares fit)
+    // -----------------------------------------------------------------
+
+    @Test
+    public void testMrdivideRecoversExactCoefficients() {
+        // Build A from {1, x, x²} on [-1, 1]. Take b = 3 - 2x + x², so
+        // the exact coefficient vector is (3, -2, 1). mrdivide should
+        // recover it to spectral precision.
+        Domain d = new Domain(-1.0, 1.0);
+        Chebfun[] cols = {
+            new Chebfun(x -> 1.0,       d),
+            new Chebfun(x -> x,         d),
+            new Chebfun(x -> x * x,     d),
+        };
+        Quasimatrix A = new Quasimatrix(cols);
+        Chebfun b = new Chebfun(x -> 3.0 - 2.0 * x + x * x, d);
+        double[] c = A.mrdivide(b);
+        assertClose(3.0,  c[0], 1e-11, "c[0]");
+        assertClose(-2.0, c[1], 1e-11, "c[1]");
+        assertClose(1.0,  c[2], 1e-11, "c[2]");
+    }
+
+    @Test
+    public void testMrdivideOnOrthonormalBasisIsInnerProducts() {
+        // If A's columns are already L²-orthonormal, mrdivide reduces to
+        // c_i = <q_i, b>. Use a simple 2-column basis: q_0 = 1/sqrt(2),
+        // q_1 = sqrt(3/2) x on [-1, 1] (rescaled Legendre P_0, P_1).
+        Domain d = new Domain(-1.0, 1.0);
+        Chebfun[] cols = {
+            new Chebfun(x -> 1.0 / Math.sqrt(2.0), d),
+            new Chebfun(x -> Math.sqrt(1.5) * x,   d),
+        };
+        Quasimatrix A = new Quasimatrix(cols);
+        // b = 4 * q_0 + 5 * q_1
+        Chebfun b = new Chebfun(x -> 4.0 / Math.sqrt(2.0) + 5.0 * Math.sqrt(1.5) * x, d);
+        double[] c = A.mrdivide(b);
+        assertClose(4.0, c[0], 1e-11, "c[0]");
+        assertClose(5.0, c[1], 1e-11, "c[1]");
+    }
+
+    @Test
+    public void testMrdivideRejectsMismatchedDomain() {
+        Chebfun[] cols = { new Chebfun(x -> 1.0, new Domain(0.0, 1.0)) };
+        Quasimatrix A = new Quasimatrix(cols);
+        Chebfun b = new Chebfun(x -> 1.0, new Domain(0.0, 2.0));
+        try {
+            A.mrdivide(b);
+            throw new AssertionError("expected domain mismatch to throw");
+        } catch (IllegalArgumentException expected) {
+            // OK
+        }
+    }
+
+>>>>>>> 60abd40 (New demos including Navier-Stokes 3D solver for incompressible flows)
     /**
      * At n=15, Householder QR on a smooth quasimatrix should give a Q whose
      * columns are L²-orthonormal to at least ~1e-10 — the current

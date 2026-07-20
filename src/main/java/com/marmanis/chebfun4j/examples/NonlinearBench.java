@@ -5,35 +5,19 @@ import com.marmanis.chebfun4j.Chebfun;
 import com.marmanis.chebfun4j.Domain;
 import com.marmanis.chebfun4j.NewtonOptions;
 import com.marmanis.chebfun4j.NonlinearChebop;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Wall-clock micro-benchmark comparing the three residual specification
- * paths on the Bratu problem {@code u'' + λ e^u = 0}:
- *
- * <ol>
- *   <li><b>FD</b> — plain scalar {@code Residual} with default centered
- *       finite-difference partials.</li>
- *   <li><b>AD scalar</b> — {@code autodiffResidual} that computes each
- *       partial by a per-grid-point {@code JAX.grad} trace (3×(n+1) traces
- *       per Newton iteration). This is what iteration 4's initial autodiff
- *       wiring did.</li>
- *   <li><b>AD batched</b> — the current {@code autodiffResidual}
- *       {@link com.marmanis.chebfun4j.NonlinearChebop.Batched} override:
- *       one vector {@code JAX.grad} trace per partial per Newton iteration
- *       via the pointwise-sum trick (3 traces per iter regardless of
- *       grid size).</li>
- * </ol>
- *
- * <p>To isolate the residual work from adaptive-grid overhead we solve at
- * a fixed grid size by pre-supplying an initial guess and stepping through
- * the grid ladder manually.
+ * paths on the Bratu problem {@code u'' + λ e^u = 0}.
  */
 public class NonlinearBench {
+    private static final Logger logger = LoggerFactory.getLogger(NonlinearBench.class);
 
     public static void main(String[] args) {
-        System.out.println("chebfun4j: nonlinear residual perf benchmark");
-        System.out.println("============================================");
-        System.out.println();
+        logger.info("chebfun4j: nonlinear residual perf benchmark");
+        logger.info("============================================");
 
         // JIT warm-up so the reported numbers reflect steady-state timings.
         for (int i = 0; i < 3; i++) { solve(0, 1.0); solve(1, 1.0); solve(2, 1.0); }
@@ -41,7 +25,7 @@ public class NonlinearBench {
         int repeats = 10;
         double[] lambdas = {1.0, 2.0, 3.0};
         for (double lam : lambdas) {
-            System.out.printf("Bratu, λ = %.1f  (u'' + λ e^u = 0, u(0) = u(1) = 0)%n", lam);
+            logger.info(String.format("Bratu, λ = %.1f  (u'' + λ e^u = 0, u(0) = u(1) = 0)", lam));
             double[] avgs = new double[3];
             for (int mode = 0; mode < 3; mode++) {
                 long t0 = System.nanoTime();
@@ -55,11 +39,10 @@ public class NonlinearBench {
                 "AD batched (vector JAX.grad per partial)"
             };
             for (int mode = 0; mode < 3; mode++) {
-                System.out.printf("  %-45s avg %.2f ms/solve%n", labels[mode], avgs[mode]);
+                logger.info(String.format("  %-45s avg %.2f ms/solve", labels[mode], avgs[mode]));
             }
-            System.out.printf("  speedup (batched vs FD):     %.1f×%n", avgs[0] / avgs[2]);
-            System.out.printf("  speedup (batched vs scalar): %.1f×%n", avgs[1] / avgs[2]);
-            System.out.println();
+            logger.info(String.format("  speedup (batched vs FD):     %.1f×", avgs[0] / avgs[2]));
+            logger.info(String.format("  speedup (batched vs scalar): %.1f×", avgs[1] / avgs[2]));
         }
     }
 
@@ -76,17 +59,9 @@ public class NonlinearBench {
         return N.solve(new Dirichlet(0.0), new Dirichlet(0.0), NewtonOptions.defaults());
     }
 
-    /**
-     * A scalar-API autodiff residual: the same math as the "AD batched"
-     * variant, but by declining to override {@link
-     * com.marmanis.chebfun4j.NonlinearChebop.Residual#batched batched},
-     * every partial goes back through the per-grid-point JAX.grad
-     * scalar closure. Used to measure the batching win directly.
-     */
     private static NonlinearChebop.Residual scalarAutodiff(double lam) {
         NonlinearChebop.Residual delegate = NonlinearChebop.autodiffResidual(
             (x, u, up, upp) -> upp.add(u.exp().mul(NonlinearChebop.scalar(lam))));
-        // Anonymous class that hides the batched override.
         return new NonlinearChebop.Residual() {
             @Override public double at(double x, double u, double up, double upp) {
                 return delegate.at(x, u, up, upp);
@@ -100,9 +75,6 @@ public class NonlinearBench {
             @Override public double dUpp(double x, double u, double up, double upp) {
                 return delegate.dUpp(x, u, up, upp);
             }
-            // Deliberately do NOT override batched(int) — so the scalar
-            // loop implementation runs, calling dU / dUp / dUpp per grid
-            // point.
         };
     }
 }

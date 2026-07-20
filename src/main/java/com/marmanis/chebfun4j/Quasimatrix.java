@@ -221,6 +221,44 @@ public final class Quasimatrix {
      */
     public Qr qr() {
         return qr(Algorithm.HOUSEHOLDER);
+<<<<<<< HEAD
+=======
+    }
+
+    /**
+     * Continuous least-squares fit: find coefficients {@code c ∈ R^n} such
+     * that {@code sum_i c_i A[:, i]} best approximates {@code b} in the
+     * {@code L²[a, b]} sense. Solves the normal equations via QR, i.e.
+     * {@code R c = Q^T b} where {@code Q^T b} is the vector of inner
+     * products {@code <q_i, b>}. Uses {@link Algorithm#HOUSEHOLDER}, so
+     * the fit stays accurate on ill-conditioned column families.
+     *
+     * <p>Precondition: {@code b}'s domain matches this quasimatrix's.
+     * The residual {@code b - sum_i c_i A[:, i]} is not returned; call the
+     * fit back through the columns yourself if you need it.
+     */
+    public double[] mrdivide(Chebfun b) {
+        if (!b.domain().equalsDomain(domain)) {
+            throw new IllegalArgumentException(
+                "mrdivide requires matching domain: " + domain + " vs " + b.domain());
+        }
+        Qr qr = qr(Algorithm.HOUSEHOLDER);
+        int n = columns.length;
+        // Q^T b: inner products of each Q column with b. Q's columns are the
+        // Chebfuns of qr.Q(); the inner product is <q_i, b> = integral(q_i b).
+        Chebfun[] qCols = qr.Q().columns;
+        double[] Qtb = new double[n];
+        for (int i = 0; i < n; i++) Qtb[i] = qCols[i].times(b).sum();
+        // Back-substitute R c = Q^T b (R is upper triangular).
+        double[][] R = qr.R();
+        double[] c = new double[n];
+        for (int i = n - 1; i >= 0; i--) {
+            double s = Qtb[i];
+            for (int j = i + 1; j < n; j++) s -= R[i][j] * c[j];
+            c[i] = s / R[i][i];
+        }
+        return c;
+>>>>>>> 60abd40 (New demos including Navier-Stokes 3D solver for incompressible flows)
     }
 
     /** Compute the QR decomposition of this quasimatrix. */

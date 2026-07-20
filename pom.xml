@@ -9,8 +9,7 @@
     <version>1.0-SNAPSHOT</version>
 
     <properties>
-        <maven.compiler.source>25</maven.compiler.source>
-        <maven.compiler.target>25</maven.compiler.target>
+        <maven.compiler.release>25</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <jax4j.version>1.0-SNAPSHOT</jax4j.version>
         <junit.version>5.10.2</junit.version>
@@ -24,6 +23,13 @@
             <groupId>com.marmanis</groupId>
             <artifactId>jax4j</artifactId>
             <version>${jax4j.version}</version>
+        </dependency>
+
+        <!-- jMatplot: Java/Swing plotting library -->
+        <dependency>
+            <groupId>com.marmanis</groupId>
+            <artifactId>jMatplot</artifactId>
+            <version>1.0-SNAPSHOT</version>
         </dependency>
 
         <!-- Logging -->
@@ -94,4 +100,50 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+            Mirrors jax4j's "tornado" profile: auto-activates when
+            TORNADOVM_HOME is set. Uses the TornadoVM 5.0+ @tornado-argfile
+            for JVM flags (module path, exports, native library path, etc.)
+            so chebfun4j tests / examples can reach TornadoVM devices via
+            the jax4j facade.
+        -->
+        <profile>
+            <id>tornado</id>
+            <activation>
+                <property><name>env.TORNADOVM_HOME</name></property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <argLine>@${env.TORNADOVM_HOME}/tornado-argfile</argLine>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>default-cli</id>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>${env.JAVA_HOME}/bin/java</executable>
+                                    <arguments>
+                                        <argument>@${env.TORNADOVM_HOME}/tornado-argfile</argument>
+                                        <argument>-classpath</argument>
+                                        <classpath/>
+                                        <argument>${exec.mainClass}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

@@ -2,62 +2,57 @@ package com.marmanis.chebfun4j.examples;
 
 import com.marmanis.chebfun4j.Chebfun;
 import com.marmanis.chebfun4j.Domain;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A short tour of chebfun4j: construct a smooth function, evaluate,
  * integrate, differentiate, and find roots and extrema — the same handful
  * of one-liners the MATLAB chebfun README opens with.
- *
- * <p>Run with:
- * <pre>
- *   mvn exec:java -Dexec.mainClass=com.marmanis.chebfun4j.examples.ChebfunDemo
- * </pre>
  */
 public class ChebfunDemo {
+    private static final Logger logger = LoggerFactory.getLogger(ChebfunDemo.class);
+
     public static void main(String[] args) {
-        System.out.println("chebfun4j demo");
-        System.out.println("==============");
+        logger.info("chebfun4j demo");
+        logger.info("==============");
 
         // Example 1: adaptive construction, evaluation, integration.
         Chebfun f = new Chebfun(x -> Math.exp(Math.sin(x)), new Domain(0.0, 2 * Math.PI));
-        System.out.printf("f(x) = e^{sin x} on [0, 2 pi]%n");
-        System.out.printf("  length()       = %d Chebyshev coefficients%n", f.length());
-        System.out.printf("  f(1.0)         = %.15f%n", f.feval(1.0));
-        System.out.printf("  integral       = %.15f  (analytic: 2 pi I_0(1) = %.15f)%n",
-                          f.sum(), 2 * Math.PI * besselI0(1.0));
-        System.out.println();
+        logger.info("f(x) = e^{sin x} on [0, 2 pi]");
+        logger.info("  length()       = {} Chebyshev coefficients", f.length());
+        logger.info(String.format("  f(1.0)         = %.15f", f.feval(1.0)));
+        logger.info(String.format("  integral       = %.15f  (analytic: 2 pi I_0(1) = %.15f)",
+                          f.sum(), 2 * Math.PI * besselI0(1.0)));
 
         // Example 2: derivative and roots.
         Chebfun g = new Chebfun(x -> x * Math.cos(3 * x), new Domain(-1.0, 1.0));
         Chebfun gPrime = g.diff();
         double[] roots = g.roots();
-        System.out.printf("g(x) = x cos(3x) on [-1, 1]%n");
-        System.out.printf("  length()       = %d%n", g.length());
-        System.out.print("  roots           = [");
+        logger.info("g(x) = x cos(3x) on [-1, 1]");
+        logger.info("  length()       = {}", g.length());
+        
+        StringBuilder sb = new StringBuilder("  roots           = [");
         for (int i = 0; i < roots.length; i++) {
-            System.out.printf("%s%.9f", i == 0 ? "" : ", ", roots[i]);
+            sb.append(String.format(i == 0 ? "%.9f" : ", %.9f", roots[i]));
         }
-        System.out.println("]");
-        System.out.printf("  g'(0.5)        = %.15f%n", gPrime.feval(0.5));
-        System.out.println();
+        sb.append("]");
+        logger.info(sb.toString());
+        
+        logger.info(String.format("  g'(0.5)        = %.15f", gPrime.feval(0.5)));
 
         // Example 3: extrema and norms.
         Chebfun h = new Chebfun(x -> Math.sin(2 * x) + 0.3 * x, new Domain(-3.0, 3.0));
         Chebfun.Extremum lo = h.min();
         Chebfun.Extremum hi = h.max();
-        System.out.printf("h(x) = sin(2x) + 0.3 x on [-3, 3]%n");
-        System.out.printf("  min            = %.12f at x = %.12f%n", lo.value(), lo.location());
-        System.out.printf("  max            = %.12f at x = %.12f%n", hi.value(), hi.location());
-        System.out.printf("  ||h||_1        = %.12f%n", h.norm1());
-        System.out.printf("  ||h||_2        = %.12f%n", h.norm2());
-        System.out.printf("  ||h||_inf      = %.12f%n", h.normInf());
+        logger.info("h(x) = sin(2x) + 0.3 x on [-3, 3]");
+        logger.info(String.format("  min            = %.12f at x = %.12f", lo.value(), lo.location()));
+        logger.info(String.format("  max            = %.12f at x = %.12f", hi.value(), hi.location()));
+        logger.info(String.format("  ||h||_1        = %.12f", h.norm1()));
+        logger.info(String.format("  ||h||_2        = %.12f", h.norm2()));
+        logger.info(String.format("  ||h||_inf      = %.12f", h.normInf()));
     }
 
-    /**
-     * Modified Bessel function of the first kind, order 0. Series form; a
-     * dozen terms is plenty at {@code x = 1}. Included so the demo can
-     * print a ground-truth value for {@code integral(e^{sin x})}.
-     */
     private static double besselI0(double x) {
         double sum = 1.0;
         double term = 1.0;

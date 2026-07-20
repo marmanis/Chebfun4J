@@ -4,20 +4,18 @@ import com.marmanis.chebfun4j.Chebfun;
 import com.marmanis.chebfun4j.Domain;
 import com.marmanis.chebfun4j.Quasimatrix;
 import com.marmanis.chebfun4j.Quasimatrix.Algorithm;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
- * QR and SVD decompositions of a Quasimatrix. Uses the classical
- * example of the monomial basis {@code {1, x, x^2, ..., x^{n-1}}} on
- * {@code [-1, 1]}: MGS and Householder QR give orthonormal Q columns
- * that are (up to sign) the Legendre polynomials, and the SVD reveals
- * the "singular values" of the raw monomial basis.
+ * QR and SVD decompositions of a Quasimatrix. Monomial basis demo.
  */
 public class QrSvdDemo {
+    private static final Logger logger = LoggerFactory.getLogger(QrSvdDemo.class);
 
     public static void main(String[] args) {
-        System.out.println("chebfun4j: Quasimatrix QR and SVD demos");
-        System.out.println("=======================================");
-        System.out.println();
+        logger.info("chebfun4j: Quasimatrix QR and SVD demos");
+        logger.info("=======================================");
 
         int n = 5;
         Domain d = new Domain(-1.0, 1.0);
@@ -28,35 +26,31 @@ public class QrSvdDemo {
         }
         Quasimatrix A = new Quasimatrix(cols);
 
-        System.out.printf("Quasimatrix A = [1, x, x^2, ..., x^%d] on [-1, 1]%n%n", n - 1);
+        logger.info(String.format("Quasimatrix A = [1, x, x^2, ..., x^%d] on [-1, 1]", n - 1));
 
         Quasimatrix.Qr mgs = A.qr(Algorithm.MODIFIED_GRAM_SCHMIDT);
         Quasimatrix.Qr hh  = A.qr(Algorithm.HOUSEHOLDER);
-        System.out.println("Q'Q on the diagonal (should be 1.0 for orthonormal columns):");
-        System.out.printf("  MGS Q:        %s%n", diag(mgs.Q(), n));
-        System.out.printf("  Householder Q: %s%n", diag(hh.Q(), n));
-        System.out.println();
+        logger.info("Q'Q on the diagonal (should be 1.0 for orthonormal columns):");
+        logger.info(String.format("  MGS Q:        %s", diag(mgs.Q(), n)));
+        logger.info(String.format("  Householder Q: %s", diag(hh.Q(), n)));
 
         double[][] R = mgs.R();
-        System.out.println("R = Q^T A (upper triangular):");
+        logger.info("R = Q^T A (upper triangular):");
         for (int i = 0; i < n; i++) {
             StringBuilder row = new StringBuilder("  ");
             for (int j = 0; j < n; j++) row.append(String.format("%9.4f ", R[i][j]));
-            System.out.println(row);
+            logger.info(row.toString());
         }
-        System.out.println();
 
         Quasimatrix.Svd svd = A.svd();
-        System.out.println("Singular values sigma_i:");
+        logger.info("Singular values sigma_i:");
         double[] sigma = svd.sigma();
         for (int i = 0; i < sigma.length; i++) {
-            System.out.printf("  sigma_%d = %.10f%n", i, sigma[i]);
+            logger.info(String.format("  sigma_%d = %.10f", i, sigma[i]));
         }
-        System.out.println();
-        System.out.printf("Condition number of A (sigma_0 / sigma_%d) = %.4f%n",
-                          n - 1, sigma[0] / sigma[sigma.length - 1]);
+        logger.info(String.format("Condition number of A (sigma_0 / sigma_%d) = %.4f",
+                          n - 1, sigma[0] / sigma[sigma.length - 1]));
 
-        // Sanity: pointwise reconstruction A = U Σ V^T.
         double[][] Vt = svd.Vt();
         double maxErr = 0.0;
         double[] xs = {-0.9, -0.4, 0.0, 0.3, 0.7};
@@ -67,7 +61,7 @@ public class QrSvdDemo {
                 maxErr = Math.max(maxErr, Math.abs(got - A.get(col).feval(x)));
             }
         }
-        System.out.printf("max A = U Σ V^T reconstruction error: %.3e%n", maxErr);
+        logger.info(String.format("max A = U Σ V^T reconstruction error: %.3e", maxErr));
     }
 
     private static String diag(Quasimatrix Q, int n) {
