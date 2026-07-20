@@ -133,8 +133,6 @@ public class QuasimatrixQrTest {
         }
     }
 
-<<<<<<< HEAD
-=======
     // -----------------------------------------------------------------
     // mrdivide (least-squares fit)
     // -----------------------------------------------------------------
@@ -189,7 +187,6 @@ public class QuasimatrixQrTest {
         }
     }
 
->>>>>>> 60abd40 (New demos including Navier-Stokes 3D solver for incompressible flows)
     /**
      * At n=15, Householder QR on a smooth quasimatrix should give a Q whose
      * columns are L²-orthonormal to at least ~1e-10 — the current

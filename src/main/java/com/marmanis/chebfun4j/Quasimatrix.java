@@ -221,8 +221,6 @@ public final class Quasimatrix {
      */
     public Qr qr() {
         return qr(Algorithm.HOUSEHOLDER);
-<<<<<<< HEAD
-=======
     }
 
     /**
@@ -258,7 +256,6 @@ public final class Quasimatrix {
             c[i] = s / R[i][i];
         }
         return c;
->>>>>>> 60abd40 (New demos including Navier-Stokes 3D solver for incompressible flows)
     }
 
     /** Compute the QR decomposition of this quasimatrix. */
