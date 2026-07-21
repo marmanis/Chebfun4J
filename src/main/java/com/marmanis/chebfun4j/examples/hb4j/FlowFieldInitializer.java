@@ -1,5 +1,6 @@
 package com.marmanis.chebfun4j.examples.hb4j;
 
+import com.marmanis.jax4j.api.Fft;
 import com.marmanis.jax4j.core.ConcreteNDArray;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.Shape;
@@ -124,6 +125,59 @@ public class FlowFieldInitializer {
     public static void initializeVortexFlow(NavierStokes3D sim) {
         logger.info("Vortex flow initialization requested. Running random flow as fallback.");
         initializeRandomFlow(sim);
+    }
+
+    /**
+     * Renormalizes the just-initialized Fourier spectrum so that the
+     * physical-space kinetic energy per grid cell equals
+     * {@code targetEnergy}.
+     *
+     * <p>Under the numpy-style FFT convention (forward unscaled, inverse
+     * ×1/N), Parseval gives {@code Σ u²/N = Σ|v̂|²/N²}. So a Σ|v̂|² of
+     * O(0.1) produces an energy of O(1/N²) — nine to twelve orders of
+     * magnitude below unity at typical LES grid sizes. This method
+     * measures the actual initial energy via one round-trip through
+     * {@code irfft3} and scales the whole spectrum by
+     * {@code √(targetEnergy / measuredEnergy)} so the caller doesn't
+     * have to reason about our FFT convention.
+     */
+    public static void rescaleInitialEnergy(NavierStokes3D sim, double targetEnergy) {
+        // Measure the current physical energy from a single component's
+        // round-trip. All three components come from the same random
+        // process at the same amplitude scale, so scaling all three by
+        // the same factor recovers the target for the total field.
+        NDArray uReal = Fft.irfft3(sim.getVeloXRe(), sim.getVeloXIm());
+        NDArray vReal = Fft.irfft3(sim.getVeloYRe(), sim.getVeloYIm());
+        NDArray wReal = Fft.irfft3(sim.getVeloZRe(), sim.getVeloZIm());
+        double[] u = uReal.toDoubleArray();
+        double[] v = vReal.toDoubleArray();
+        double[] w = wReal.toDoubleArray();
+        double sumSq = 0.0;
+        for (int i = 0; i < u.length; i++) {
+            sumSq += u[i] * u[i] + v[i] * v[i] + w[i] * w[i];
+        }
+        double measuredEnergy = sumSq / u.length;
+        if (measuredEnergy < 1e-300) {
+            logger.warn("Measured initial energy is essentially zero; skipping rescale.");
+            return;
+        }
+        double factor = Math.sqrt(targetEnergy / measuredEnergy);
+        logger.info("Rescaling initial flow: measured E = {}, target E = {}, factor = {}",
+            String.format("%.4e", measuredEnergy),
+            String.format("%.4e", targetEnergy),
+            String.format("%.4e", factor));
+
+        scaleInPlace(sim.getVeloXRe(), factor);
+        scaleInPlace(sim.getVeloXIm(), factor);
+        scaleInPlace(sim.getVeloYRe(), factor);
+        scaleInPlace(sim.getVeloYIm(), factor);
+        scaleInPlace(sim.getVeloZRe(), factor);
+        scaleInPlace(sim.getVeloZIm(), factor);
+    }
+
+    private static void scaleInPlace(NDArray a, double factor) {
+        double[] data = a.toDoubleArray();
+        for (int i = 0; i < data.length; i++) data[i] *= factor;
     }
 
     private static void cleanSymmetries(int n1, int n2, int half, double[] re, double[] im) {

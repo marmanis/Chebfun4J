@@ -2,7 +2,6 @@ package com.marmanis.chebfun4j.examples.hb4j;
 
 import com.marmanis.jax4j.api.Fft;
 import com.marmanis.jax4j.core.ConcreteNDArray;
-import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.Device;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.Shape;
@@ -10,9 +9,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
-import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Properties;
+
+import static com.marmanis.chebfun4j.util.Setup.envIntOr;
+import static com.marmanis.chebfun4j.util.Setup.envIntOrNull;
 
 /**
  * 3-D Periodic Incompressible Navier-Stokes Spectral Simulation (HB4J).
@@ -24,6 +25,7 @@ import java.util.Properties;
  * <p>The time advancement is performed using a stiffly stable scheme of order 1, 2, or 3, 
  * with implicit treatment of the linear terms (diffusion) and explicit projection for the 
  * divergence-free constraint in Fourier space.
+ *
  */
 public class NavierStokes3D {
 
@@ -43,7 +45,12 @@ public class NavierStokes3D {
 
     // Simulation configuration parameters (loaded from properties or configured dynamically)
     private boolean newflo = true;
-    private boolean scaleFlow = false;
+    // Default ON: without this, the physical energy is O(1/N²) — machine
+    // epsilon at typical grid sizes — because ranflow generates
+    // Fourier coefficients on an O(0.1) scale that is only meaningful
+    // under a different FFT-normalization convention. See
+    // FlowFieldInitializer.rescaleInitialEnergy.
+    private boolean scaleFlow = true;
     private boolean traveling = false;
     private boolean firstOrder = false;
     private boolean storeFile = true;
@@ -315,6 +322,17 @@ public class NavierStokes3D {
             } else if (initialFlow == 2) {
                 FlowFieldInitializer.initializeVortexFlow(this);
             }
+            // ranflow sets Fourier coefficients on an O(0.1) amplitude
+            // scale, but with our numpy-style FFT normalization
+            // (forward unscaled, inverse ×1/N) this yields physical
+            // velocities of O(1/N), i.e., energy O(1/N²) — machine
+            // epsilon at typical grid sizes. Renormalize the whole
+            // spectrum here so the initial physical energy equals the
+            // configured target. The Fortran reference declared this
+            // toggle but never actually implemented the rescale.
+            if (scaleFlow) {
+                FlowFieldInitializer.rescaleInitialEnergy(this, scaleEnergy);
+            }
         } else {
             logger.info("Attempting restart from checkpoint...");
             loadCheckpoint("checkpoint.dat");
@@ -377,7 +395,14 @@ public class NavierStokes3D {
         logger.info("Starting simulation loop for {} steps...", nhalt);
         logger.info(String.format("%10s %10s %10s %10s", "ttime", "a1", "a2", "a3"));
 
+        // Per-iteration wall-time collected so we can report warmup (istep=0,
+        // includes cuFFT plan build + JIT) separately from the steady-state
+        // average. Enables host↔GPU benchmarking without external harness.
+        long loopStartNs = System.nanoTime();
+        long firstIterNs = 0L;
+
         for (int istep = 0; istep <= nhalt; istep++) {
+            long iterStartNs = System.nanoTime();
             // 1. Compute Vorticity in Fourier space: w = i k x v
             double[] vxRe = veloXRe.toDoubleArray();
             double[] vxIm = veloXIm.toDoubleArray();
@@ -437,9 +462,15 @@ public class NavierStokes3D {
                 LzData[idx] = uData[idx] * wyData[idx] - vData[idx] * wxData[idx];
             }
 
-            // Logging short statistics
+            // Logging short statistics — pass velocity, vorticity, AND
+            // Lamb vector so FlowStatistics can compute all four
+            // physical invariants (energy, enstrophy, |Lamb|², helicity),
+            // matching HB_lib2.f90 short_stat.
             if (istep % nshort == 0) {
-                FlowStatistics.logShortStats(ttime, n1, n2, n3, uData, vData, wData);
+                FlowStatistics.logShortStats(ttime, n1, n2, n3,
+                    uData, vData, wData,
+                    wxData, wyData, wzData,
+                    LxData, LyData, LzData);
             }
 
             // 5. Forward FFT Lamb vector to Fourier space
@@ -615,9 +646,18 @@ public class NavierStokes3D {
             veloZIm = wrap(nvzIm, shape);
 
             ttime += dt;
+            long iterNs = System.nanoTime() - iterStartNs;
+            if (istep == 0) firstIterNs = iterNs;
         }
 
+        long totalNs = System.nanoTime() - loopStartNs;
+        long steadyNs = totalNs - firstIterNs;
+        int steadyIters = Math.max(nhalt, 1); // istep=1..nhalt
         logger.info("Simulation loop finished.");
+        logger.info(String.format(
+            "Timing on %s: %d steps in %.2f s (first %.2f s, steady-state %.3f s/iter avg)",
+            device.getName(), nhalt + 1, totalNs / 1e9,
+            firstIterNs / 1e9, (steadyNs / 1e9) / steadyIters));
         if (storeFile) {
             saveCheckpoint("checkpoint.dat");
         }
@@ -641,6 +681,13 @@ public class NavierStokes3D {
     public double getC4() { return c4; }
     public double getFacp() { return facp; }
     public boolean isPlank() { return plank; }
+
+    public NDArray getVeloXRe() { return veloXRe; }
+    public NDArray getVeloXIm() { return veloXIm; }
+    public NDArray getVeloYRe() { return veloYRe; }
+    public NDArray getVeloYIm() { return veloYIm; }
+    public NDArray getVeloZRe() { return veloZRe; }
+    public NDArray getVeloZIm() { return veloZIm; }
 
     public void setVelocityFields(NDArray vxRe, NDArray vxIm, NDArray vyRe, NDArray vyIm, NDArray vzRe, NDArray vzIm) {
         this.veloXRe = vxRe;
@@ -678,7 +725,13 @@ public class NavierStokes3D {
         String envDev = System.getenv("HB4J_DEVICE");
         if (envDev != null && envDev.equalsIgnoreCase("gpu")) useGpu = true;
 
-        NavierStokes3D sim = new NavierStokes3D(64, 64, 64);
+        // Grid size and iteration count are env-configurable so the
+        // benchmark can compare 64³/128³ host vs GPU without touching
+        // source or the properties file.
+        int grid = envIntOr("HB4J_GRID", 64);
+        Integer nhaltOverride = envIntOrNull("HB4J_NHALT");
+
+        NavierStokes3D sim = new NavierStokes3D(grid, grid, grid);
         if (useGpu) {
             Device d = Device.defaultDevice();
             sim.setDevice(d);
@@ -687,6 +740,8 @@ public class NavierStokes3D {
             logger.info("Host mode (pass --gpu to route FFTs through cuFFT)");
         }
         sim.loadProperties("src/test/resources/simulation.properties");
+        if (nhaltOverride != null) sim.nhalt = nhaltOverride;
+        logger.info("Grid = {}³, nhalt = {}", grid, sim.nhalt);
         sim.initialize();
         sim.run();
     }
