@@ -13,4 +13,11 @@ public class Setup {
         try { return Integer.parseInt(v.trim()); }
         catch (NumberFormatException e) { return null; }
     }
+
+    public static Long envLongOrNull(String name) {
+        String v = System.getenv(name);
+        if (v == null) return null;
+        try { return Long.parseLong(v.trim()); }
+        catch (NumberFormatException e) { return null; }
+    }
 }

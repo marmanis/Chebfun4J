@@ -11,6 +11,72 @@ The library is built on [jax4j](../jax4j) — the FFT/DCT primitives, the
 LU-based dense solver, and the eigenvalue solver all live there in
 `com.marmanis.jax4j.api.{Fft,Linalg}`, and are reusable outside chebfun4j.
 
+## What's since iteration 5
+
+Cross-cutting work spanning `jax4j` (GPU FFT bridge) and `chebfun4j`
+(NavierStokes3D end-to-end run):
+
+- **JDK 25 + TornadoVM 5.0.** Both projects moved to
+  `maven.compiler.release=25`. A `tornado` Maven profile auto-activates
+  when `TORNADOVM_HOME` is set and consumes the SDK's `@tornado-argfile`
+  so surefire and exec:exec pick up module path, exports, and native
+  library path for the installed backend (`-ptx`, `-opencl`, or
+  `-cuda`) with no per-flag maintenance.
+- **cuFFT bridge in `jax4j.api.Fft`.** New `Fft.fftOnDevice`,
+  `fft3OnDevice`, `rfft3OnDevice`, `irfft3OnDevice` explicit GPU
+  paths, plus auto-dispatch inside the existing `Fft.fft`/`ifft`/
+  `fft3`/`ifft3`/`rfft3`/`irfft3` when inputs sit on a non-host
+  `Device` and the tornado-cufft module is on the boot layer. 3-D
+  routines run as three batched cuFFT calls plus two `@Parallel`
+  cyclic-shift transposes inside one `TaskGraph`, keeping the tensor
+  device-resident from upload through download. A per-(shape,
+  direction) plan cache (`Plan3F32` / `Plan3F64`) reuses one
+  `TornadoExecutionPlan` per shape so cuFFT's internal workspace
+  isn't leaked per iteration.
+- **`NavierStokes3D` on the GPU.** `sim.setDevice(Device.defaultDevice())`
+  before `initialize()` routes every velocity/vorticity/Lamb buffer
+  through the target device, which the auto-dispatched `rfft3`/`irfft3`
+  then run on cuFFT. End-to-end 128³ measured at 1.49× vs host —
+  see `../jax4j/docs/backend-benchmark.html` for the panel and the
+  Amdahl explanation (host-side spectral algebra caps the achievable
+  speedup near ~1.5× for this solver).
+- **Random-flow initializer rewritten.** `FlowFieldInitializer`
+  now draws each of the six complex-Gaussian component fields from an
+  independent stream via `jax4j.api.Random.normal` + splittable keys.
+  Removes the short-range RNG correlations the previous Ran2 setup
+  introduced by drawing x/y/z from consecutive `next()` calls on the
+  same stream. `HB4J_SEED` env var lets a run be re-realized under a
+  different draw.
+- **Initial-energy rescale + isotropy.**
+  `FlowFieldInitializer.rescaleInitialEnergy` measures each velocity
+  component's physical energy after `ranflow` and scales it
+  independently to `simulation.scaleEnergy / 3`. In one pass this
+  drives total physical energy to the configured target (needed
+  because ranflow's Fourier amplitudes only make sense under a
+  different FFT convention) and enforces `a1 = a2 = a3 = 1/3` at
+  `t = 0` to machine precision, removing the Monte Carlo variance a
+  single realization would otherwise leave.
+- **Physical invariants + disk-based plotting.**
+  `FlowStatistics.logShortStats` now computes the four Fortran-
+  reference quantities per timestep — energy `Σ|u|²/N`, enstrophy
+  `Σ|ω|²/N`, `|Lamb|² Σ|u×ω|²/N`, helicity `Σ(u·ω)/N` — and appends
+  them to `ShortStats.dat`. `computeAndWriteSpectra` appends raw
+  spectra to `Spectra.dat`. At end of run, `showPlots()` reloads
+  both files and renders a two-tab window: the four invariants vs
+  time in the Statistics tab; the spectra in the Spectra tab with a
+  slider + Play button that animates snapshots on globally-normalized
+  linear axes pinned at `k ∈ [1, N/2]`, `y ∈ [-1.1, 1.1]`. Standalone
+  `PlotViewer` main lets you reopen the same window against any
+  completed run's artifacts:
+  `mvn -P!tornado exec:java -Dexec.mainClass=…PlotViewer -Dexec.args="ShortStats.dat Spectra.dat"`.
+- **Ergonomics.** `NavierStokes3D` main reads `HB4J_GRID`,
+  `HB4J_NHALT`, `HB4J_SEED`, `HB4J_DEVICE=gpu` env vars so runs are
+  reconfigured without touching the properties file. `initialize()`
+  now opens with a framed banner logging every effective setting
+  (grid, all `simulation.*` knobs, device, seed, plus the FFT and
+  domain assumptions baked into the code) — the log is
+  self-describing.
+
 ## What's in iteration 5
 
 Everything from earlier iterations plus:

@@ -22,8 +22,27 @@ public class FlowStatistics {
     // and builds the plots — no in-memory carry-over. This decouples
     // compute from visualization and lets us open the plot window later
     // (or from a separate program) against any completed run's artifacts.
-    public static final String SHORT_STATS_FILE = "ShortStats.dat";
-    public static final String SPECTRA_FILE     = "Spectra.dat";
+    // Output filenames — mutable so a driver (NavierStokes3D main) can
+    // tag each run's artifacts with the same <simID>_<timestamp> the
+    // checkpoint uses, so all three files from one run cluster
+    // together on disk. Defaults kept for PlotViewer's ergonomic path.
+    public static String SHORT_STATS_FILE = "ShortStats.dat";
+    public static String SPECTRA_FILE     = "Spectra.dat";
+
+    /**
+     * Redirect subsequent {@code logShortStats} / {@code computeAndWriteSpectra}
+     * output. Must be called BEFORE the first stats step, otherwise
+     * the header row lands in the old file. Passing {@code null}
+     * leaves that name at its current value.
+     */
+    public static void setOutputFiles(String shortStatsPath, String spectraPath) {
+        if (shortStatsPath != null) SHORT_STATS_FILE = shortStatsPath;
+        if (spectraPath    != null) SPECTRA_FILE     = spectraPath;
+        // Force a fresh file on next append — the previous filename's
+        // "initialized" flag would otherwise skip the header.
+        shortStatsFileInitialized = false;
+        spectraFileInitialized    = false;
+    }
 
     // Tracks whether we've truncated the output files this JVM. The
     // first call to log/compute per file gets a fresh file; subsequent
@@ -39,10 +58,11 @@ public class FlowStatistics {
      */
     private record ShortStatsRow(
         double ttime,
-        double energy,     // Σ|u|²   / N   -- probe(9)
-        double enstrophy,  // Σ|ω|²   / N   -- probe(4+5+6)
-        double lambSq,     // Σ|u×ω|² / N   -- probe(10)
-        double helicity) {}// Σ u·ω   / N   -- probe(7)
+        double energy,       // Σ|u|²   / N   -- probe(9)
+        double enstrophy,    // Σ|ω|²   / N   -- probe(4+5+6)
+        double dissipation,  // ν · enstrophy  -- probe(8)
+        double lambSq,       // Σ|u×ω|² / N   -- probe(10), a.k.a. strophokinesis
+        double helicity) {}  // Σ u·ω   / N   -- probe(7)
 
     /**
      * One 1-D spherical-shell spectrum snapshot at a fixed simulation
@@ -83,7 +103,7 @@ public class FlowStatistics {
      * the animation panel plots).
      */
     public static void logShortStats(
-            double ttime, int n1, int n2, int n3,
+            double ttime, double rnu, int n1, int n2, int n3,
             double[] u,  double[] v,  double[] w,
             double[] wx, double[] wy, double[] wz,
             double[] Lx, double[] Ly, double[] Lz) {
@@ -103,20 +123,21 @@ public class FlowStatistics {
             sumLambSq += Lx[i] * Lx[i] + Ly[i] * Ly[i] + Lz[i] * Lz[i];
         }
 
-        double energy    = (sumU2 + sumV2 + sumW2)   / npts;    // probe(9)
-        double enstrophy = (sumWx2 + sumWy2 + sumWz2) / npts;   // probe(4+5+6)
-        double lambSq    = sumLambSq / npts;                    // probe(10)
-        double helicity  = sumHel / npts;                       // probe(7)
+        double energy      = (sumU2 + sumV2 + sumW2)   / npts;   // probe(9)
+        double enstrophy   = (sumWx2 + sumWy2 + sumWz2) / npts;  // probe(4+5+6)
+        double dissipation = rnu * enstrophy;                    // probe(8) = ν·Ω
+        double lambSq      = sumLambSq / npts;                   // probe(10)
+        double helicity    = sumHel / npts;                      // probe(7)
 
         double a1 = energy > 1e-15 ? Math.abs((sumU2 / npts) / energy) : 0.0;
         double a2 = energy > 1e-15 ? Math.abs((sumV2 / npts) / energy) : 0.0;
         double a3 = energy > 1e-15 ? Math.abs((sumW2 / npts) / energy) : 0.0;
 
         logger.info(String.format(
-            "t=%10.6f  E=%12.5e  Ω=%12.5e  |L|²=%12.5e  H=%12.5e  (a1=%.3f a2=%.3f a3=%.3f)",
-            ttime, energy, enstrophy, lambSq, helicity, a1, a2, a3));
+            "t=%10.6f  E=%12.5e  Ω=%12.5e  ε=%12.5e  |L|²=%12.5e  H=%12.5e  (a1=%.3f a2=%.3f a3=%.3f)",
+            ttime, energy, enstrophy, dissipation, lambSq, helicity, a1, a2, a3));
 
-        appendShortStatsRow(ttime, energy, enstrophy, lambSq, helicity);
+        appendShortStatsRow(ttime, energy, enstrophy, dissipation, lambSq, helicity);
     }
 
     /**
@@ -126,16 +147,17 @@ public class FlowStatistics {
      * by other tools (numpy loadtxt, awk, etc.).
      */
     private static void appendShortStatsRow(double ttime, double energy,
-                                            double enstrophy, double lambSq, double helicity) {
+                                            double enstrophy, double dissipation,
+                                            double lambSq, double helicity) {
         boolean append = shortStatsFileInitialized;
         try (PrintWriter w = new PrintWriter(new BufferedWriter(new FileWriter(SHORT_STATS_FILE, append)))) {
             if (!append) {
                 w.println("# HB4J short-stats — one row per stats step (per-cell, /N)");
-                w.println("# columns: ttime  energy  enstrophy  lambSq  helicity");
+                w.println("# columns: ttime  energy  enstrophy  dissipation(ν·Ω)  lambSq(strophokinesis)  helicity");
                 shortStatsFileInitialized = true;
             }
-            w.printf("%14.7e  %14.7e  %14.7e  %14.7e  %14.7e%n",
-                ttime, energy, enstrophy, lambSq, helicity);
+            w.printf("%14.7e  %14.7e  %14.7e  %14.7e  %14.7e  %14.7e%n",
+                ttime, energy, enstrophy, dissipation, lambSq, helicity);
         } catch (IOException e) {
             logger.error("Failed to write short stats to {}: {}", SHORT_STATS_FILE, e.getMessage());
         }
@@ -303,34 +325,19 @@ public class FlowStatistics {
         double[] enstrophy = stats.stream().mapToDouble(ShortStatsRow::enstrophy).toArray();
         double[] lambSq    = stats.stream().mapToDouble(ShortStatsRow::lambSq).toArray();
         double[] helicity  = stats.stream().mapToDouble(ShortStatsRow::helicity).toArray();
+        // dissipation column is still read + stored (for external tooling)
+        // even though no in-tab plot consumes it after the Cascade tab
+        // was removed.
 
-        // 1. Short-stats figure: the four physical invariants tracked by
-        //    the Fortran reference. Each shares the same time axis and
-        //    physical units differ, so we plot them all in one panel and
-        //    rely on the legend + colors to distinguish.
-        com.marmanis.jMatplot.core.Figure figStats = new com.marmanis.jMatplot.core.Figure();
-        com.marmanis.jMatplot.core.Axes axStats = figStats.addAxes();
+        // Visibility state for each panel's curves — mutable arrays so
+        // menu toggles change the flag in place and a refresh callback
+        // reads the current value. All curves start visible.
+        final boolean[] statsVisible = {true, true, true, true};
+        final boolean[] specVisible  = {true, true, true, true};
 
-        com.marmanis.jMatplot.core.Line2D l1 = axStats.plot(time, energy);
-        l1.setColor(Color.RED);
-        l1.setLabel("Energy  Σ|u|²/N");
-
-        com.marmanis.jMatplot.core.Line2D l2 = axStats.plot(time, enstrophy);
-        l2.setColor(Color.GREEN);
-        l2.setLabel("Enstrophy  Σ|ω|²/N");
-
-        com.marmanis.jMatplot.core.Line2D l3 = axStats.plot(time, lambSq);
-        l3.setColor(Color.BLUE);
-        l3.setLabel("|Lamb|²  Σ|u×ω|²/N");
-
-        com.marmanis.jMatplot.core.Line2D l4 = axStats.plot(time, helicity);
-        l4.setColor(Color.ORANGE);
-        l4.setLabel("Helicity  Σ(u·ω)/N");
-
-        axStats.setXLabel("Time");
-        axStats.setYLabel("Value (per cell)");
-        axStats.setTitle("Short Statistics: Energy · Enstrophy · Lamb² · Helicity");
-        axStats.legend();
+        final double[] timeF = time, energyF = energy, enstrophyF = enstrophy,
+                       lambSqF = lambSq, helicityF = helicity;
+        final List<SpectraSnapshot> spectraFinal = spectra;
 
         // All Swing UI construction MUST run on the Event Dispatch
         // Thread. Building the JFrame on the caller's thread (main, or
@@ -339,26 +346,100 @@ public class FlowStatistics {
         // stops responding to input — exactly what we were seeing.
         // invokeLater lets showPlots return immediately; the window's
         // lifecycle is managed by the EDT afterwards.
-        final com.marmanis.jMatplot.core.Figure figStatsFinal = figStats;
-        final List<SpectraSnapshot> spectraFinal = spectra;
         javax.swing.SwingUtilities.invokeLater(() -> {
             com.marmanis.jMatplot.core.PlotPanel panelStats =
-                new com.marmanis.jMatplot.core.PlotPanel(figStatsFinal);
-            javax.swing.JComponent spectraTab = buildSpectraTab(spectraFinal);
+                new com.marmanis.jMatplot.core.PlotPanel(
+                    buildStatsFigure(timeF, energyF, enstrophyF, lambSqF, helicityF, statsVisible));
+            SpectraTabView spectraTabView = buildSpectraTab(spectraFinal, specVisible);
+
+            Runnable refreshStats = () -> panelStats.setFigure(
+                buildStatsFigure(timeF, energyF, enstrophyF, lambSqF, helicityF, statsVisible));
 
             javax.swing.JFrame frame = new javax.swing.JFrame("Navier-Stokes 3-D Simulation Analysis");
             frame.setDefaultCloseOperation(javax.swing.JFrame.DISPOSE_ON_CLOSE);
             frame.setSize(800, 600);
+            frame.setJMenuBar(buildViewMenuBar(statsVisible, specVisible, refreshStats, spectraTabView.refresh()));
 
             javax.swing.JTabbedPane tabbedPane = new javax.swing.JTabbedPane();
             tabbedPane.addTab("Short Statistics", panelStats);
-            tabbedPane.addTab("Flow Spectra", spectraTab);
+            tabbedPane.addTab("Flow Spectra", spectraTabView.tab());
 
             frame.getContentPane().add(tabbedPane);
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);
             logger.info("Simulation analysis plots window displayed successfully.");
         });
+    }
+
+    /** Curve-index labels for the stats visibility array (matches menu order). */
+    static final String[] STATS_LABELS = {
+        "Energy  Σ|u|²/N", "Enstrophy  Σ|ω|²/N", "|Lamb|²  Σ|u×ω|²/N", "Helicity  Σ(u·ω)/N"
+    };
+    private static final Color[] STATS_COLORS = { Color.RED, Color.GREEN, Color.BLUE, Color.ORANGE };
+
+    /**
+     * Builds the "Short Statistics" figure showing whichever of the
+     * four physical invariants the visibility array marks true. Split
+     * out from {@link #showPlots} so a menu toggle can rebuild it
+     * with a different subset without recomputing anything.
+     */
+    private static com.marmanis.jMatplot.core.Figure buildStatsFigure(
+            double[] time, double[] energy, double[] enstrophy, double[] lambSq, double[] helicity,
+            boolean[] visible) {
+        com.marmanis.jMatplot.core.Figure fig = new com.marmanis.jMatplot.core.Figure();
+        com.marmanis.jMatplot.core.Axes ax = fig.addAxes();
+        double[][] series = { energy, enstrophy, lambSq, helicity };
+        for (int i = 0; i < 4; i++) {
+            if (!visible[i]) continue;
+            com.marmanis.jMatplot.core.Line2D ln = ax.plot(time, series[i]);
+            ln.setColor(STATS_COLORS[i]);
+            ln.setLabel(STATS_LABELS[i]);
+        }
+        ax.setXLabel("Time");
+        ax.setYLabel("Value (per cell)");
+        ax.setTitle("Short Statistics: Energy · Enstrophy · Lamb² · Helicity");
+        ax.legend();
+        return fig;
+    }
+
+    /**
+     * Assembles the frame's menu bar. Two "View" submenus — one per
+     * plot panel — carry a checkbox per curve. Toggling a checkbox
+     * flips the flag in the shared visibility array and calls the
+     * relevant refresh callback, which rebuilds the figure and pushes
+     * it to the PlotPanel via {@code setFigure}.
+     */
+    private static javax.swing.JMenuBar buildViewMenuBar(
+            boolean[] statsVisible, boolean[] specVisible,
+            Runnable refreshStats, Runnable refreshSpectra) {
+        javax.swing.JMenuBar bar = new javax.swing.JMenuBar();
+        javax.swing.JMenu view = new javax.swing.JMenu("View");
+
+        javax.swing.JMenu statsMenu = new javax.swing.JMenu("Short Statistics curves");
+        for (int i = 0; i < STATS_LABELS.length; i++) {
+            final int idx = i;
+            javax.swing.JCheckBoxMenuItem item = new javax.swing.JCheckBoxMenuItem(STATS_LABELS[i], statsVisible[i]);
+            item.addActionListener(e -> {
+                statsVisible[idx] = item.isSelected();
+                refreshStats.run();
+            });
+            statsMenu.add(item);
+        }
+        javax.swing.JMenu specMenu = new javax.swing.JMenu("Flow Spectra curves");
+        for (int i = 0; i < SPEC_LABELS.length; i++) {
+            final int idx = i;
+            javax.swing.JCheckBoxMenuItem item = new javax.swing.JCheckBoxMenuItem(SPEC_LABELS[i], specVisible[i]);
+            item.addActionListener(e -> {
+                specVisible[idx] = item.isSelected();
+                refreshSpectra.run();
+            });
+            specMenu.add(item);
+        }
+
+        view.add(statsMenu);
+        view.add(specMenu);
+        bar.add(view);
+        return bar;
     }
 
     /**
@@ -376,13 +457,14 @@ public class FlowStatistics {
                 line = line.trim();
                 if (line.isEmpty() || line.startsWith("#")) continue;
                 String[] parts = line.split("\\s+");
-                if (parts.length < 5) continue;
+                if (parts.length < 6) continue;
                 out.add(new ShortStatsRow(
                     Double.parseDouble(parts[0]),
                     Double.parseDouble(parts[1]),
                     Double.parseDouble(parts[2]),
                     Double.parseDouble(parts[3]),
-                    Double.parseDouble(parts[4])));
+                    Double.parseDouble(parts[4]),
+                    Double.parseDouble(parts[5])));
             }
         }
         return out;
@@ -483,37 +565,65 @@ public class FlowStatistics {
      * tick — cheaper than mutating Line2D data and keeps the whole
      * render path stateless.
      */
-    private static com.marmanis.jMatplot.core.Figure buildSpectraFigure(SpectraSnapshot s) {
+    /** Curve-index labels for spectra visibility array (matches menu order). */
+    static final String[] SPEC_LABELS = {
+        "Energy (phi1)", "Dissipation (phi2)", "|Helicity| (|phi3|)", "Strophokinesis (phi4)"
+    };
+    private static final Color[] SPEC_COLORS = { Color.RED, Color.GREEN, Color.BLUE, Color.ORANGE };
+
+    private static com.marmanis.jMatplot.core.Figure buildSpectraFigure(SpectraSnapshot s, boolean[] visible) {
         com.marmanis.jMatplot.core.Figure fig = new com.marmanis.jMatplot.core.Figure();
         com.marmanis.jMatplot.core.Axes ax = fig.addAxes();
 
-        com.marmanis.jMatplot.core.Line2D l1 = ax.plot(s.wavenumbers(), s.phi1());
-        l1.setColor(Color.RED);
-        l1.setLabel("Energy Spectrum (phi1)");
+        // Log-y needs strictly positive values. The load-path already
+        // normalized every φ to [-1, 1] (global-max), so a floor of
+        // 1e-6 is well below anything a healthy spectrum carries but
+        // safely above zero. Take |·| so negative shell contributions
+        // (φ3 helicity) show as magnitude; sign visibility isn't
+        // useful on a log scale anyway.
+        double[][] p = {
+            absFloored(s.phi1(), Y_FLOOR),
+            absFloored(s.phi2(), Y_FLOOR),
+            absFloored(s.phi3(), Y_FLOOR),
+            absFloored(s.phi4(), Y_FLOOR)
+        };
+        for (int i = 0; i < 4; i++) {
+            if (!visible[i]) continue;
+            com.marmanis.jMatplot.core.Line2D ln = ax.plot(s.wavenumbers(), p[i]);
+            ln.setColor(SPEC_COLORS[i]);
+            ln.setLabel(SPEC_LABELS[i]);
+        }
 
-        com.marmanis.jMatplot.core.Line2D l2 = ax.plot(s.wavenumbers(), s.phi2());
-        l2.setColor(Color.GREEN);
-        l2.setLabel("Dissipation Spectrum (phi2)");
-
-        com.marmanis.jMatplot.core.Line2D l3 = ax.plot(s.wavenumbers(), s.phi3());
-        l3.setColor(Color.BLUE);
-        l3.setLabel("Helicity Spectrum (phi3)");
-
-        com.marmanis.jMatplot.core.Line2D l4 = ax.plot(s.wavenumbers(), s.phi4());
-        l4.setColor(Color.ORANGE);
-        l4.setLabel("Lamb Vector Spectrum (phi4)");
-
+        // X-axis stays fixed to the box's wavenumber range (1..N/2).
+        // Y-axis: log-scale, pinned to [Y_FLOOR, 1.1] so the decade
+        // ticks are identical for every snapshot — only the curves
+        // move as the flow decays, not the axis scale.
+        double kMin = s.wavenumbers()[0];
+        double kMax = s.wavenumbers()[s.wavenumbers().length - 1];
+        ax.setXLim(kMin, kMax);
+        ax.setYLim(Y_FLOOR, 1.1);
+        ax.setLogScale(false, true);
+        ax.setLogYBase(10.0);
+        ax.setShowMinorTicksY(true);
+        ax.setShowMinorGridY(true);
+        ax.setMinorGridStyleY("Dotted");
         ax.setXLabel("Wavenumber k");
-        ax.setYLabel("Spectrum (normalized to global max)");
+        ax.setYLabel("Spectra (normalized to global Max, log₁₀)");
         ax.setTitle(String.format("Flow Spectra @ t = %.4f", s.ttime()));
-        // Linear axes throughout: log-log on data spanning 30 decades
-        // was hanging jMatplot's auto-limit + tick-generation logic.
-        // We normalize globally in loadSpectraNormalized instead, so
-        // the earliest snapshot still peaks near 1 and later snapshots
-        // visibly droop on a linear y — preserving the "decay is
-        // visible when scrubbing" property without the log-scale risk.
         ax.legend();
         return fig;
+    }
+
+    /** Floor for log-y plotting — six decades below the pinned y-max of 1.1. */
+    private static final double Y_FLOOR = 1e-4;
+
+    private static double[] absFloored(double[] in, double floor) {
+        double[] out = new double[in.length];
+        for (int i = 0; i < in.length; i++) {
+            double v = Math.abs(in[i]);
+            out[i] = v > floor ? v : floor;
+        }
+        return out;
     }
 
     /**
@@ -532,7 +642,14 @@ public class FlowStatistics {
      * per tick; the caller can pause at any point by clicking Pause, or
      * scrub manually and the animation resumes from wherever it lands.
      */
-    private static javax.swing.JComponent buildSpectraTab(List<SpectraSnapshot> spectraHistory) {
+    /**
+     * Holder for a spectra tab: the Swing component to insert plus a
+     * {@link #refresh} callback the caller can invoke to redraw the
+     * current snapshot after menu toggles change the visibility array.
+     */
+    private record SpectraTabView(javax.swing.JComponent tab, Runnable refresh) {}
+
+    private static SpectraTabView buildSpectraTab(List<SpectraSnapshot> spectraHistory, boolean[] visible) {
         javax.swing.JPanel container = new javax.swing.JPanel(new java.awt.BorderLayout());
 
         if (spectraHistory.isEmpty()) {
@@ -541,12 +658,12 @@ public class FlowStatistics {
             com.marmanis.jMatplot.core.Figure fig = new com.marmanis.jMatplot.core.Figure();
             fig.addAxes().setTitle("No Spectra Data Available");
             container.add(new com.marmanis.jMatplot.core.PlotPanel(fig), java.awt.BorderLayout.CENTER);
-            return container;
+            return new SpectraTabView(container, () -> {});
         }
 
         final int lastIdx = spectraHistory.size() - 1;
         com.marmanis.jMatplot.core.PlotPanel plotPanel =
-            new com.marmanis.jMatplot.core.PlotPanel(buildSpectraFigure(spectraHistory.get(lastIdx)));
+            new com.marmanis.jMatplot.core.PlotPanel(buildSpectraFigure(spectraHistory.get(lastIdx), visible));
 
         // ── slider spans the whole recorded history, starting at the end ──
         javax.swing.JSlider slider = new javax.swing.JSlider(0, lastIdx, lastIdx);
@@ -583,7 +700,7 @@ public class FlowStatistics {
         slider.addChangeListener(e -> {
             int idx = slider.getValue();
             SpectraSnapshot s = spectraHistory.get(idx);
-            plotPanel.setFigure(buildSpectraFigure(s));
+            plotPanel.setFigure(buildSpectraFigure(s, visible));
             timeLabel.setText(String.format("t = %.4f", s.ttime()));
         });
 
@@ -607,6 +724,13 @@ public class FlowStatistics {
 
         container.add(plotPanel, java.awt.BorderLayout.CENTER);
         container.add(controls, java.awt.BorderLayout.SOUTH);
-        return container;
+        // The refresh callback re-renders the currently-selected
+        // snapshot with the current visibility array — invoked by menu
+        // toggles from the frame-level View menu.
+        Runnable refresh = () -> {
+            int idx = slider.getValue();
+            plotPanel.setFigure(buildSpectraFigure(spectraHistory.get(idx), visible));
+        };
+        return new SpectraTabView(container, refresh);
     }
 }

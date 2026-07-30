@@ -14,6 +14,7 @@ import java.util.Properties;
 
 import static com.marmanis.chebfun4j.util.Setup.envIntOr;
 import static com.marmanis.chebfun4j.util.Setup.envIntOrNull;
+import static com.marmanis.chebfun4j.util.Setup.envLongOrNull;
 
 /**
  * 3-D Periodic Incompressible Navier-Stokes Spectral Simulation (HB4J).
@@ -62,9 +63,10 @@ public class NavierStokes3D {
     private double scaleEnergy = 1.0;
     private double rnu = 0.0001; // Kinematic viscosity
     private double uForce = 0.0;
-    private double vAlpha = 0.05;
-    private double vBeta = 0.5;
-    private double vortexStrength = 0.015;
+    private double[] vAlpha = {0.05};
+    private double[] vBeta = {0.5};
+    private double[] vortexStrength = {0.015};
+    private double vortexTubeSeparation = 1.0;
     private int vCell = 6;
     private int vStep = 6;
     private double vRatio = 0.2;
@@ -75,6 +77,26 @@ public class NavierStokes3D {
     private int norder = 2; // Stiffly stable marching scheme order (1, 2, or 3)
     private double dt = 0.0001; // Timestep size
     private double c1 = 1.0, c2 = -1.0, c3 = -1.0, c4 = 1.0; // Random flow spectrum constants
+    // Seed for the initial random-flow spectrum. Exposed as
+    // HB4J_SEED so a run can be re-realized under a different draw
+    // without a source change — useful for averaging isotropy
+    // diagnostics over independent realizations.
+    private long randomSeed = -27343L;
+
+    // Path of the checkpoint file to restart FROM when newflo=false.
+    // Populated from the simulation.oldflow.file property; can also be
+    // set via a positional arg to main(). Required when newflo=false —
+    // no default filename, since silently loading a stale
+    // "checkpoint.dat" that happens to be in the cwd would be a nasty
+    // way to get a run that doesn't reflect the current properties.
+    private String oldflowFile = null;
+
+    // Short (8-hex-char) SHA-256 of the loaded properties-file bytes.
+    // Baked into checkpoint filenames so a saved state is trivially
+    // paired with the config that produced it; two runs of the same
+    // properties file share an ID even across timestamps, and two
+    // runs with different tweaks can never accidentally collide.
+    private String simulationID = "nosim";
 
     // Velocity fields in Fourier space (represented as real/imaginary NDArray pairs of shape (n1, n2, half))
     private NDArray veloXRe, veloXIm;
@@ -192,9 +214,10 @@ public class NavierStokes3D {
             scaleEnergy = Double.parseDouble(props.getProperty("simulation.scaleEnergy", String.valueOf(scaleEnergy)));
             rnu = Double.parseDouble(props.getProperty("simulation.rnu", String.valueOf(rnu)));
             uForce = Double.parseDouble(props.getProperty("simulation.uForce", String.valueOf(uForce)));
-            vAlpha = Double.parseDouble(props.getProperty("simulation.vAlpha", String.valueOf(vAlpha)));
-            vBeta = Double.parseDouble(props.getProperty("simulation.vBeta", String.valueOf(vBeta)));
-            vortexStrength = Double.parseDouble(props.getProperty("simulation.vortexStrength", String.valueOf(vortexStrength)));
+            vAlpha = parseDoubleArray(props.getProperty("simulation.vAlpha"), vAlpha);
+            vBeta = parseDoubleArray(props.getProperty("simulation.vBeta"), vBeta);
+            vortexStrength = parseDoubleArray(props.getProperty("simulation.vortexStrength"), vortexStrength);
+            vortexTubeSeparation = Double.parseDouble(props.getProperty("simulation.vortexTubeSeparation", String.valueOf(vortexTubeSeparation)));
             vCell = Integer.parseInt(props.getProperty("simulation.vCell", String.valueOf(vCell)));
             vStep = Integer.parseInt(props.getProperty("simulation.vStep", String.valueOf(vStep)));
             vRatio = Double.parseDouble(props.getProperty("simulation.vRatio", String.valueOf(vRatio)));
@@ -208,10 +231,49 @@ public class NavierStokes3D {
             c2 = Double.parseDouble(props.getProperty("simulation.c2", String.valueOf(c2)));
             c3 = Double.parseDouble(props.getProperty("simulation.c3", String.valueOf(c3)));
             c4 = Double.parseDouble(props.getProperty("simulation.c4", String.valueOf(c4)));
+            String ofp = props.getProperty("simulation.oldflow.file");
+            if (ofp != null && !ofp.trim().isEmpty()) oldflowFile = ofp.trim();
+            simulationID = shortHashOf(file);
             logger.info("Properties successfully loaded from: {}", path);
         } catch (IOException e) {
             logger.error("Error reading properties file: {}", e.getMessage(), e);
         }
+    }
+
+    /**
+     * First 8 hex chars of the SHA-256 of the file bytes — a stable,
+     * config-derived short identifier for the run. Falls back to
+     * {@code "nosim"} on any error so a broken hash never blocks the run.
+     */
+    private static String shortHashOf(File file) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] hash = md.digest(java.nio.file.Files.readAllBytes(file.toPath()));
+            StringBuilder sb = new StringBuilder(8);
+            for (int i = 0; i < 4; i++) sb.append(String.format("%02x", hash[i]));
+            return sb.toString();
+        } catch (Exception e) {
+            logger.warn("Could not hash {} for simulationID: {}", file, e.getMessage());
+            return "nosim";
+        }
+    }
+
+    /**
+     * Sets an explicit path to the checkpoint file to restart FROM.
+     * Overrides {@code simulation.oldflow.file}. Useful when calling
+     * {@code main()} with a positional argument, or programmatically
+     * from a driver script.
+     */
+    public void setOldflowFile(String path) { this.oldflowFile = path; }
+
+    public String getSimulationID() { return simulationID; }
+
+    private static double[] parseDoubleArray(String raw, double[] fallback) {
+        if (raw == null || raw.isBlank()) return fallback;
+        String[] parts = raw.split(",");
+        double[] out = new double[parts.length];
+        for (int i = 0; i < parts.length; i++) out[i] = Double.parseDouble(parts[i].trim());
+        return out;
     }
 
     /**
@@ -258,6 +320,10 @@ public class NavierStokes3D {
             FlowFieldInitializer.initializeRandomFlow(this);
             return;
         }
+        if (path.toLowerCase(java.util.Locale.ROOT).endsWith(".csv")) {
+            loadCsvCheckpoint(file);
+            return;
+        }
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
             int fileN1 = in.readInt();
             int fileN2 = in.readInt();
@@ -300,10 +366,275 @@ public class NavierStokes3D {
     }
 
     /**
+     * Loads the initial flow from a CSV file. Each row must have exactly
+     * 9 whitespace- or comma-separated numbers:
+     * <pre>
+     *     i  j  k   u  v  w   wx  wy  wz
+     * </pre>
+     * where {@code (i, j, k)} are 1-based grid indices in [1, N], the
+     * middle triple is the velocity at that grid point, and the last
+     * triple is the vorticity (used for validation only). Blank lines
+     * and lines whose first non-whitespace character is '#' are ignored.
+     *
+     * <p>The file must contain exactly N³ rows, one per grid cell, in
+     * any order. The grid size N is inferred from the maximum index and
+     * must match {@code n1 = n2 = n3}. After loading, the velocity is
+     * transformed to Fourier space; the vorticity from columns 7–9 is
+     * compared against the curl computed from the loaded velocity, and
+     * max-abs / RMS differences are logged.
+     */
+    private void loadCsvCheckpoint(File file) {
+        if (n1 != n2 || n2 != n3) {
+            throw new IllegalStateException(String.format(
+                "CSV loader requires a cubic grid (n1=n2=n3); got %dx%dx%d",
+                n1, n2, n3));
+        }
+        int N = n1;
+        int total = N * N * N;
+
+        double[] u  = new double[total];
+        double[] v  = new double[total];
+        double[] w  = new double[total];
+        double[] wx = new double[total];
+        double[] wy = new double[total];
+        double[] wz = new double[total];
+        boolean[] filled = new boolean[total];
+
+        int rowCount = 0;
+        int detectedMaxIdx = 0;
+        try (BufferedReader in = new BufferedReader(new FileReader(file))) {
+            String line;
+            int lineNo = 0;
+            while ((line = in.readLine()) != null) {
+                lineNo++;
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) continue;
+                // Skip header lines whose first token isn't numeric.
+                String[] tok = trimmed.split("[,\\s]+");
+                if (tok.length < 9) {
+                    throw new IOException(String.format(
+                        "CSV line %d: expected 9 fields (i j k u v w wx wy wz), got %d",
+                        lineNo, tok.length));
+                }
+                int i, j, k;
+                try {
+                    i = Integer.parseInt(tok[0]);
+                    j = Integer.parseInt(tok[1]);
+                    k = Integer.parseInt(tok[2]);
+                } catch (NumberFormatException nfe) {
+                    // Non-numeric first token — treat as a header row and skip.
+                    if (rowCount == 0) continue;
+                    throw new IOException(String.format(
+                        "CSV line %d: expected integer indices (i j k), got '%s %s %s'",
+                        lineNo, tok[0], tok[1], tok[2]));
+                }
+                if (i < 1 || j < 1 || k < 1) {
+                    throw new IOException(String.format(
+                        "CSV line %d: 1-based indices must be >= 1; got (%d, %d, %d)",
+                        lineNo, i, j, k));
+                }
+                if (i > N || j > N || k > N) {
+                    throw new IOException(String.format(
+                        "CSV line %d: index (%d, %d, %d) out of range for N=%d",
+                        lineNo, i, j, k, N));
+                }
+                detectedMaxIdx = Math.max(detectedMaxIdx, Math.max(i, Math.max(j, k)));
+
+                int i0 = i - 1, j0 = j - 1, k0 = k - 1;
+                int idx = (i0 * N + j0) * N + k0;
+                if (filled[idx]) {
+                    throw new IOException(String.format(
+                        "CSV line %d: duplicate grid cell (i=%d, j=%d, k=%d)",
+                        lineNo, i, j, k));
+                }
+                u[idx]  = Double.parseDouble(tok[3]);
+                v[idx]  = Double.parseDouble(tok[4]);
+                w[idx]  = Double.parseDouble(tok[5]);
+                wx[idx] = Double.parseDouble(tok[6]);
+                wy[idx] = Double.parseDouble(tok[7]);
+                wz[idx] = Double.parseDouble(tok[8]);
+                filled[idx] = true;
+                rowCount++;
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read CSV checkpoint " + file + ": " + e.getMessage(), e);
+        }
+
+        if (rowCount != total) {
+            throw new IllegalArgumentException(String.format(
+                "CSV checkpoint %s: expected %d rows (N=%d, cubic), got %d",
+                file, total, N, rowCount));
+        }
+        if (detectedMaxIdx != N) {
+            throw new IllegalArgumentException(String.format(
+                "CSV checkpoint %s: detected max index %d but simulation grid N=%d",
+                file, detectedMaxIdx, N));
+        }
+
+        Shape realShape = new Shape(N, N, N);
+        NDArray[] uSpec = Fft.rfft3(new ConcreteNDArray(u, realShape));
+        NDArray[] vSpec = Fft.rfft3(new ConcreteNDArray(v, realShape));
+        NDArray[] wSpec = Fft.rfft3(new ConcreteNDArray(w, realShape));
+
+        Shape spectralShape = new Shape(n1, n2, half);
+        veloXRe = wrap(uSpec[0].toDoubleArray(), spectralShape);
+        veloXIm = wrap(uSpec[1].toDoubleArray(), spectralShape);
+        veloYRe = wrap(vSpec[0].toDoubleArray(), spectralShape);
+        veloYIm = wrap(vSpec[1].toDoubleArray(), spectralShape);
+        veloZRe = wrap(wSpec[0].toDoubleArray(), spectralShape);
+        veloZIm = wrap(wSpec[1].toDoubleArray(), spectralShape);
+
+        ttime = 0.0;
+        logger.info("CSV checkpoint loaded: {} rows from {} (ttime reset to 0)", rowCount, file);
+
+        compareVorticityAgainstCurl(wx, wy, wz);
+    }
+
+    /**
+     * Computes vorticity ω = ∇×u in Fourier space from the currently
+     * loaded velocity fields, transforms it back to physical space, and
+     * reports max-abs / RMS differences vs the {@code wxRef/wyRef/wzRef}
+     * reference triples (typically the vorticity columns from a CSV
+     * checkpoint). Never blocks the run — a mismatch is logged, not thrown.
+     */
+    private void compareVorticityAgainstCurl(double[] wxRef, double[] wyRef, double[] wzRef) {
+        double[] uxRe = veloXRe.toDoubleArray();
+        double[] uxIm = veloXIm.toDoubleArray();
+        double[] uyRe = veloYRe.toDoubleArray();
+        double[] uyIm = veloYIm.toDoubleArray();
+        double[] uzRe = veloZRe.toDoubleArray();
+        double[] uzIm = veloZIm.toDoubleArray();
+
+        int specSize = n1 * n2 * half;
+        double[] wxReSpec = new double[specSize];
+        double[] wxImSpec = new double[specSize];
+        double[] wyReSpec = new double[specSize];
+        double[] wyImSpec = new double[specSize];
+        double[] wzReSpec = new double[specSize];
+        double[] wzImSpec = new double[specSize];
+
+        for (int i = 0; i < n1; i++) {
+            for (int j = 0; j < n2; j++) {
+                for (int k = 0; k < half; k++) {
+                    int idx = (i * n2 + j) * half + k;
+                    double kxv = kx[i], kyv = ky[j], kzv = kz[k];
+                    // ω̂ = i k × û  ⇒  ω̂.re = -k×û_im, ω̂.im = k×û_re
+                    wxReSpec[idx] = -(kyv * uzIm[idx] - kzv * uyIm[idx]);
+                    wxImSpec[idx] =  (kyv * uzRe[idx] - kzv * uyRe[idx]);
+                    wyReSpec[idx] = -(kzv * uxIm[idx] - kxv * uzIm[idx]);
+                    wyImSpec[idx] =  (kzv * uxRe[idx] - kxv * uzRe[idx]);
+                    wzReSpec[idx] = -(kxv * uyIm[idx] - kyv * uxIm[idx]);
+                    wzImSpec[idx] =  (kxv * uyRe[idx] - kyv * uxRe[idx]);
+                }
+            }
+        }
+
+        Shape sShape = new Shape(n1, n2, half);
+        double[] wxCurl = Fft.irfft3(wrap(wxReSpec, sShape), wrap(wxImSpec, sShape)).toDoubleArray();
+        double[] wyCurl = Fft.irfft3(wrap(wyReSpec, sShape), wrap(wyImSpec, sShape)).toDoubleArray();
+        double[] wzCurl = Fft.irfft3(wrap(wzReSpec, sShape), wrap(wzImSpec, sShape)).toDoubleArray();
+
+        double maxAbsX = 0, maxAbsY = 0, maxAbsZ = 0;
+        double sumSqX  = 0, sumSqY  = 0, sumSqZ  = 0;
+        double refMaxAbs = 0, refSumSq = 0;
+        int total = wxRef.length;
+        for (int i = 0; i < total; i++) {
+            double dx = wxCurl[i] - wxRef[i];
+            double dy = wyCurl[i] - wyRef[i];
+            double dz = wzCurl[i] - wzRef[i];
+            maxAbsX = Math.max(maxAbsX, Math.abs(dx));
+            maxAbsY = Math.max(maxAbsY, Math.abs(dy));
+            maxAbsZ = Math.max(maxAbsZ, Math.abs(dz));
+            sumSqX += dx*dx; sumSqY += dy*dy; sumSqZ += dz*dz;
+            double refMag = Math.abs(wxRef[i]) + Math.abs(wyRef[i]) + Math.abs(wzRef[i]);
+            refMaxAbs = Math.max(refMaxAbs, refMag);
+            refSumSq += wxRef[i]*wxRef[i] + wyRef[i]*wyRef[i] + wzRef[i]*wzRef[i];
+        }
+        double rmsX = Math.sqrt(sumSqX / total);
+        double rmsY = Math.sqrt(sumSqY / total);
+        double rmsZ = Math.sqrt(sumSqZ / total);
+        double refRms = Math.sqrt(refSumSq / total);
+        double relRms = refRms > 0 ? Math.sqrt((sumSqX + sumSqY + sumSqZ) / total) / refRms : Double.NaN;
+
+        double tol = 1e-6;
+        String severity = (relRms > tol) ? "WARN" : "OK";
+        logger.info("Vorticity check ({}): max|Δω|=({}, {}, {})  RMS=({}, {}, {})  rel-RMS={}  (ref maxAbs={}, RMS={})",
+            severity, maxAbsX, maxAbsY, maxAbsZ, rmsX, rmsY, rmsZ, relRms, refMaxAbs, refRms);
+        if (relRms > tol) {
+            logger.warn("Vorticity from CSV disagrees with curl(u) by rel-RMS={} > tol={}. Continuing.", relRms, tol);
+        }
+    }
+
+    /**
+     * Pretty-prints every effective setting at simulation start:
+     * grid + derived box parameters, the value of every knob that
+     * {@link #loadProperties} may have overridden, and the two runtime
+     * switches ({@link #device}, {@link #randomSeed}) that come from
+     * {@code main()}'s env vars. Grouped by concern and framed with a
+     * banner so it's easy to skim in a long log.
+     *
+     * <p>Prints defaults verbatim — the log shows what the run WILL
+     * use, not a diff against defaults. That way a run's log is
+     * self-describing and can be replayed from what it printed.
+     */
+    private void logSettings() {
+        String bar = "════════════════════════════════════════════════════════════════════════";
+        logger.info(bar);
+        logger.info("  NavierStokes3D — effective simulation settings");
+        logger.info(bar);
+        logger.info("  Grid            : {}×{}×{}   (half = {} Fourier-half along axis-3)",
+                    n1, n2, n3, half);
+        logger.info("  Box wavenumbers : fx={}  fy={}  fz={}", fx, fy, fz);
+        logger.info("  Real spacing    : dx={}  dx2={}", dx, dx2);
+        logger.info("  Device          : {}", device);
+        logger.info("  Random seed     : {}   (override via HB4J_SEED)", randomSeed);
+        logger.info("  Simulation ID   : {}   (SHA-256 short-hash of simulation.properties)", simulationID);
+        logger.info("  Old-flow file   : {}", oldflowFile != null ? oldflowFile : "(none — fresh flow)");
+        logger.info("  ── Time marching ─────────────────────────────────────────────────");
+        logger.info("    nhalt (total steps)          = {}", nhalt);
+        logger.info("    dt (step size)               = {}", dt);
+        logger.info("    ttime (start time)           = {}", ttime);
+        logger.info("    norder (stiffly-stable order)= {}", norder);
+        logger.info("    firstOrder (force order 1?)  = {}", firstOrder);
+        logger.info("  ── Logging & I/O ────────────────────────────────────────────────");
+        logger.info("    nshort (stats every N steps) = {}", nshort);
+        logger.info("    nspec  (spectra every N stps)= {}", nspec);
+        logger.info("    storeFile (write checkpoint) = {}", storeFile);
+        logger.info("  ── De-aliasing & viscosity ──────────────────────────────────────");
+        logger.info("    cutoff (spectral cutoff)     = {}", cutoff);
+        logger.info("    rnu    (kinematic viscosity) = {}", rnu);
+        logger.info("    filterRhalf                  = {}", filterRhalf);
+        logger.info("  ── Initial flow ─────────────────────────────────────────────────");
+        logger.info("    newflo (fresh vs. restart)   = {}", newflo);
+        logger.info("    initialFlow (1=random,2=vortex,3=tube-along-z,4=two-parallel-tubes)= {}", initialFlow);
+        logger.info("    scaleFlow → E={} per component", scaleFlow ? String.valueOf(scaleEnergy) : "OFF");
+        logger.info("    facp (peak wavenumber)       = {}", facp);
+        logger.info("    plank (spectrum shape)       = {}", plank);
+        logger.info("    scaleflow / traveling        = {} / {}", scaleFlow, traveling);
+        logger.info("    c1..c4 (spectrum constants)  = {}, {}, {}, {}", c1, c2, c3, c4);
+        logger.info("  ── Vortex-cell params (used only if initialFlow=2) ─────────────");
+        logger.info("    vAlpha={}  vBeta={}  strength={}  tubeSep={}",
+            java.util.Arrays.toString(vAlpha),
+            java.util.Arrays.toString(vBeta),
+            java.util.Arrays.toString(vortexStrength),
+            vortexTubeSeparation);
+        logger.info("    vCell={}   vStep={}   vRatio={}", vCell, vStep, vRatio);
+        logger.info("  ── Forcing ──────────────────────────────────────────────────────");
+        logger.info("    uForce = {}", uForce);
+        logger.info("  ── Assumptions ──────────────────────────────────────────────────");
+        logger.info("    FFT convention: forward unscaled, inverse ×1/N (numpy style)");
+        logger.info("    Periodic cubic domain of side 2π");
+        logger.info("    Marching: implicit diffusion, explicit projection for div-free");
+        logger.info("    Stats files: ShortStats.dat, Spectra.dat (raw magnitudes)");
+        logger.info(bar);
+    }
+
+    /**
      * Initializes the simulation arrays and loads either the configured initial flow
      * or a checkpoint for a restart run.
      */
     public void initialize() {
+        logSettings();
         initFilter();
 
         Shape shape = new Shape(n1, n2, half);
@@ -321,6 +652,10 @@ public class NavierStokes3D {
                 FlowFieldInitializer.initializeRandomFlow(this);
             } else if (initialFlow == 2) {
                 FlowFieldInitializer.initializeVortexFlow(this);
+            } else if (initialFlow == 3) {
+                FlowFieldInitializer.initializeVortexTube(this);
+            } else if (initialFlow == 4) {
+                FlowFieldInitializer.initializeTwoVortexTubes(this);
             }
             // ranflow sets Fourier coefficients on an O(0.1) amplitude
             // scale, but with our numpy-style FFT normalization
@@ -334,8 +669,19 @@ public class NavierStokes3D {
                 FlowFieldInitializer.rescaleInitialEnergy(this, scaleEnergy);
             }
         } else {
-            logger.info("Attempting restart from checkpoint...");
-            loadCheckpoint("checkpoint.dat");
+            // Restart path: newflo=false MUST come with an explicit
+            // checkpoint file, either via simulation.oldflow.file or
+            // main()'s positional arg. Silently defaulting to some
+            // filename in the cwd is a nice way to load a stale
+            // "checkpoint.dat" from an unrelated run.
+            if (oldflowFile == null) {
+                throw new IllegalStateException(
+                    "simulation.newflow=false requires an old-flow checkpoint. " +
+                    "Set 'simulation.oldflow.file=<path>' in the properties file, " +
+                    "or pass the path as the first positional arg to main().");
+            }
+            logger.info("Restarting from checkpoint: {}", oldflowFile);
+            loadCheckpoint(oldflowFile);
         }
     }
 
@@ -367,6 +713,20 @@ public class NavierStokes3D {
      * Executes the main simulation loop for nhalt timesteps.
      */
     public void run() {
+        // One tag per run — <simID>_<yyyyMMdd-HHmmss>. All three
+        // artifacts written by this run (ShortStats, Spectra, checkpoint)
+        // share it, so files from one simulation cluster together and
+        // never collide with files from another run of the same config.
+        // Timestamp is taken at run start (not end) so the ShortStats
+        // and Spectra files can be tagged BEFORE their first append.
+        String runStamp = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss").format(new java.util.Date());
+        String runTag = simulationID + "_" + runStamp;
+        FlowStatistics.setOutputFiles(
+            "ShortStats_" + runTag + ".dat",
+            "Spectra_"    + runTag + ".dat");
+        logger.info("Run tag: {}  → ShortStats_{}.dat, Spectra_{}.dat, checkpoint_{}.dat",
+            runTag, runTag, runTag, runTag);
+
         int J_order = 1;
         double alpha02 = 2.0, alpha12 = -0.5;
         double alpha03 = 3.0, alpha13 = -1.5, alpha23 = 1.0 / 3.0;
@@ -467,7 +827,7 @@ public class NavierStokes3D {
             // physical invariants (energy, enstrophy, |Lamb|², helicity),
             // matching HB_lib2.f90 short_stat.
             if (istep % nshort == 0) {
-                FlowStatistics.logShortStats(ttime, n1, n2, n3,
+                FlowStatistics.logShortStats(ttime, rnu, n1, n2, n3,
                     uData, vData, wData,
                     wxData, wyData, wzData,
                     LxData, LyData, LzData);
@@ -484,7 +844,8 @@ public class NavierStokes3D {
 
             // Extract spectra
             if (istep % nspec == 0) {
-                FlowStatistics.computeAndWriteSpectra("Spectra.dat", rnu, ttime, n1, n2, n3, half,
+                FlowStatistics.computeAndWriteSpectra(FlowStatistics.SPECTRA_FILE,
+                                                      rnu, ttime, n1, n2, n3, half,
                                                       kx2, ky2, kz2,
                                                       veloXRe, veloXIm, veloYRe, veloYIm, veloZRe, veloZIm,
                                                       LxRe, LxIm, LyRe, LyIm, LzRe, LzIm);
@@ -659,7 +1020,9 @@ public class NavierStokes3D {
             device.getName(), nhalt + 1, totalNs / 1e9,
             firstIterNs / 1e9, (steadyNs / 1e9) / steadyIters));
         if (storeFile) {
-            saveCheckpoint("checkpoint.dat");
+            // Same runTag as the stats/spectra files above — the three
+            // artifacts from one run all share the same identifier.
+            saveCheckpoint("checkpoint_" + runTag + ".dat");
         }
         FlowStatistics.showPlots();
     }
@@ -681,6 +1044,20 @@ public class NavierStokes3D {
     public double getC4() { return c4; }
     public double getFacp() { return facp; }
     public boolean isPlank() { return plank; }
+    public int getN3() { return n3; }
+    public double getRnu() { return rnu; }
+    public double getVAlpha() { return vAlpha[0]; }
+    public double getVBeta() { return vBeta[0]; }
+    public double getVortexStrength() { return vortexStrength[0]; }
+    public double[] getVAlphaArray() { return vAlpha; }
+    public double[] getVBetaArray() { return vBeta; }
+    public double[] getVortexStrengthArray() { return vortexStrength; }
+    public double getVortexTubeSeparation() { return vortexTubeSeparation; }
+    public int getVCell() { return vCell; }
+    public int getVStep() { return vStep; }
+    public double getVRatio() { return vRatio; }
+    public long getRandomSeed() { return randomSeed; }
+    public void setRandomSeed(long seed) { this.randomSeed = seed; }
 
     public NDArray getVeloXRe() { return veloXRe; }
     public NDArray getVeloXIm() { return veloXIm; }
@@ -721,7 +1098,17 @@ public class NavierStokes3D {
         // up automatically. Without the flag we stay on the host so the
         // test suite and non-GPU runs behave as before.
         boolean useGpu = false;
-        for (String a : args) if ("--gpu".equalsIgnoreCase(a)) useGpu = true;
+        String oldflowArg = null;
+        for (String a : args) {
+            if ("--gpu".equalsIgnoreCase(a)) {
+                useGpu = true;
+            } else if (!a.startsWith("-")) {
+                // First non-flag positional arg is the restart checkpoint
+                // path (used when simulation.newflow=false and the
+                // properties file doesn't set simulation.oldflow.file).
+                if (oldflowArg == null) oldflowArg = a;
+            }
+        }
         String envDev = System.getenv("HB4J_DEVICE");
         if (envDev != null && envDev.equalsIgnoreCase("gpu")) useGpu = true;
 
@@ -730,6 +1117,7 @@ public class NavierStokes3D {
         // source or the properties file.
         int grid = envIntOr("HB4J_GRID", 64);
         Integer nhaltOverride = envIntOrNull("HB4J_NHALT");
+        Long seedOverride = envLongOrNull("HB4J_SEED");
 
         NavierStokes3D sim = new NavierStokes3D(grid, grid, grid);
         if (useGpu) {
@@ -741,7 +1129,9 @@ public class NavierStokes3D {
         }
         sim.loadProperties("src/test/resources/simulation.properties");
         if (nhaltOverride != null) sim.nhalt = nhaltOverride;
-        logger.info("Grid = {}³, nhalt = {}", grid, sim.nhalt);
+        if (seedOverride != null) sim.setRandomSeed(seedOverride);
+        if (oldflowArg != null) sim.setOldflowFile(oldflowArg);
+        logger.info("Grid = {}³, nhalt = {}, seed = {}", grid, sim.nhalt, sim.getRandomSeed());
         sim.initialize();
         sim.run();
     }
